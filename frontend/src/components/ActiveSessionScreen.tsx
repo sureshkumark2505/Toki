@@ -16,7 +16,6 @@ interface ActiveSessionScreenProps {
 export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
   sessionId,
   initialTopic,
-  userId = 1,
   onEndSession,
   onMinimize,
 }) => {
@@ -25,6 +24,7 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
   const [isMicMuted, setIsMicMuted] = useState(false);
   const [transcripts, setTranscripts] = useState<TranscriptItem[]>([]);
   const [currentTokiSpeech, setCurrentTokiSpeech] = useState('');
+  const [currentUserSpeech, setCurrentUserSpeech] = useState('');
   const [showKeyboardDrawer, setShowKeyboardDrawer] = useState(false);
   const [textInput, setTextInput] = useState('');
   const [isLiveConnected, setIsLiveConnected] = useState(false);
@@ -57,12 +57,19 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
     switch (voiceState) {
       case 'listening':
         return { text: 'Listening to you...', color: 'text-[#8ed5ff]' };
+      case 'user_speaking':
+        return { text: 'Listening... speaking', color: 'text-[#38bdf8]' };
       case 'thinking':
         return { text: 'Toki is reflecting...', color: 'text-[#ffc176]' };
       case 'speaking':
         return { text: 'Toki is speaking...', color: 'text-[#38bdf8]' };
       case 'paused':
         return { text: 'Paused', color: 'text-[#87929a]' };
+      case 'error':
+        return { text: 'Connection issue • Reconnecting', color: 'text-[#ffb4ab]' };
+      case 'idle':
+      default:
+        return { text: 'Ready', color: 'text-[#87929a]' };
     }
   };
 
@@ -99,18 +106,24 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
           setCurrentTokiSpeech('');
         }
       },
-      onUserTranscript: (userText) => {
+      onUserTranscript: (userText, isInterim) => {
         if (!userText.trim()) return;
-        wordsExchangedRef.current += userText.trim().split(/\s+/).length;
-        setTranscripts((prev) => [
-          ...prev,
-          {
-            id: `user-${Date.now()}`,
-            speaker: 'user',
-            text: userText.trim(),
-            timestamp: formatTime(seconds),
-          },
-        ]);
+
+        if (isInterim) {
+          setCurrentUserSpeech(userText.trim());
+        } else {
+          setCurrentUserSpeech('');
+          wordsExchangedRef.current += userText.trim().split(/\s+/).length;
+          setTranscripts((prev) => [
+            ...prev,
+            {
+              id: `user-${Date.now()}`,
+              speaker: 'user',
+              text: userText.trim(),
+              timestamp: formatTime(seconds),
+            },
+          ]);
+        }
       },
       onInterrupted: () => {
         // Instant Barge-In
@@ -155,7 +168,7 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
         });
       });
     }
-  }, [transcripts, currentTokiSpeech]);
+  }, [transcripts, currentTokiSpeech, currentUserSpeech]);
 
   // Toggle mic button
   const handleToggleMic = () => {
@@ -173,7 +186,7 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
     }
 
     const durationMins = Math.max(1, Math.round(seconds / 60));
-    const totalWords = Math.max(wordsExchangedRef.current, transcripts.length * 8);
+    const totalWords = Math.max(wordsExchangedRef.current, transcripts.length * 6);
 
     try {
       if (sessionId) {
@@ -235,8 +248,9 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
       sessionTitle: initialTopic || 'Voice Practice Session',
       durationMinutes: durationMins,
       wordsExchanged: totalWords,
-      coachReflection:
-        'Wonderful live conversation! You spoke naturally with little hesitation and engaged thoughtfully.',
+      coachReflection: transcripts.length > 0
+        ? 'Wonderful live conversation! You spoke naturally with little hesitation and engaged thoughtfully.'
+        : 'Your conversation was saved, but there was not enough transcript data to generate detailed feedback.',
       strengths: [
         {
           title: 'Fluent real-time flow',
@@ -246,17 +260,13 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
           title: 'Active interaction',
           description: 'Quickly adapted to follow-up questions and dialogue',
         },
-        {
-          title: 'Clear articulation',
-          description: 'Smooth vowel transitions and balanced speech cadence',
-        },
       ],
       improvement: {
         focusTitle: 'Natural expression flow',
         category: 'Conversational nuance',
-        insteadOf: sampleUserSentence || 'Great effort in speaking today!',
-        wrongFragment: sampleUserSentence ? sampleUserSentence.split(' ')[0] : 'Great',
-        trySaying: sampleUserSentence ? `I enjoyed discussing this topic today.` : 'I enjoyed discussing this topic today.',
+        insteadOf: sampleUserSentence || 'Practice greeting and introducing yourself.',
+        wrongFragment: sampleUserSentence ? sampleUserSentence.split(' ')[0] : 'Practice',
+        trySaying: sampleUserSentence ? 'I enjoyed discussing this topic today.' : 'I enjoyed discussing this topic today.',
         correctFragment: 'I enjoyed',
         audioPronunciationText: 'I enjoyed discussing this topic today.',
       },
@@ -337,7 +347,7 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
           <div className="relative z-10 my-auto flex flex-col items-center">
             <TokiOrb
               size="hero"
-              state={voiceState}
+              state={voiceState === 'user_speaking' ? 'listening' : voiceState === 'error' ? 'paused' : voiceState}
               interactive={true}
               onClick={() => {
                 if (voiceState === 'speaking' && liveClientRef.current) {
@@ -349,12 +359,12 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
 
             {/* Calm Dynamic State Label */}
             <div className="mt-3 flex items-center gap-2 h-7">
-              {voiceState === 'listening' && (
+              {(voiceState === 'listening' || voiceState === 'user_speaking') && (
                 <span className="flex items-center gap-1 px-1">
-                  <span className="w-0.5 h-3 bg-[#8ed5ff] rounded-full animate-bounce" style={{ animationDelay: '0.1s' }} />
-                  <span className="w-0.5 h-5 bg-[#38bdf8] rounded-full animate-bounce" style={{ animationDelay: '0.25s' }} />
-                  <span className="w-0.5 h-2 bg-[#8ed5ff] rounded-full animate-bounce" style={{ animationDelay: '0.4s' }} />
-                  <span className="w-0.5 h-4 bg-[#38bdf8] rounded-full animate-bounce" style={{ animationDelay: '0.2s' }} />
+                  <span className={`w-0.5 rounded-full animate-bounce ${voiceState === 'user_speaking' ? 'h-4 bg-[#38bdf8]' : 'h-3 bg-[#8ed5ff]'}`} style={{ animationDelay: '0.1s' }} />
+                  <span className={`w-0.5 rounded-full animate-bounce ${voiceState === 'user_speaking' ? 'h-6 bg-[#8ed5ff]' : 'h-5 bg-[#38bdf8]'}`} style={{ animationDelay: '0.25s' }} />
+                  <span className={`w-0.5 rounded-full animate-bounce ${voiceState === 'user_speaking' ? 'h-3 bg-[#38bdf8]' : 'h-2 bg-[#8ed5ff]'}`} style={{ animationDelay: '0.4s' }} />
+                  <span className={`w-0.5 rounded-full animate-bounce ${voiceState === 'user_speaking' ? 'h-5 bg-[#8ed5ff]' : 'h-4 bg-[#38bdf8]'}`} style={{ animationDelay: '0.2s' }} />
                 </span>
               )}
               <span className={`text-[13px] font-medium tracking-wide transition-colors ${stateMsg.color}`}>
@@ -372,7 +382,7 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
                 graphic_eq
               </span>
               <span className="text-[11px] font-bold text-[#bdc8d1] uppercase tracking-wider font-['Plus_Jakarta_Sans']">
-                Live Stream
+                Live Read-Along Stream
               </span>
             </div>
             <span className="text-[11px] text-[#87929a]">Barge-in enabled</span>
@@ -398,6 +408,18 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
                 </p>
               );
             })}
+
+            {/* Currently spoken live user speech (interim) */}
+            {currentUserSpeech && (
+              <div className="rounded-xl p-2.5 bg-[#141820] border border-[#38bdf8]/30">
+                <span className="text-[11px] font-semibold text-[#38bdf8] block mb-0.5 uppercase tracking-wide">
+                  You (Speaking):
+                </span>
+                <p className="text-[14px] text-[#bdc8d1] leading-snug italic">
+                  &ldquo;{currentUserSpeech}...&rdquo;
+                </p>
+              </div>
+            )}
 
             {/* Currently streaming Toki sentence (prominent read-along) */}
             {currentTokiSpeech && (
@@ -428,7 +450,7 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
 
           {/* Main Dynamic Voice Hub Mic Button */}
           <div className="relative flex items-center justify-center">
-            {!isMicMuted && voiceState === 'listening' && (
+            {!isMicMuted && (voiceState === 'listening' || voiceState === 'user_speaking') && (
               <div
                 className="absolute -inset-2 rounded-full bg-[#38bdf8]/25 animate-ping pointer-events-none"
                 id="micPulseRing"

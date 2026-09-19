@@ -8,8 +8,6 @@ from ..config import settings
 
 logger = logging.getLogger("gemini_live")
 
-LIVE_MODEL_NAME = "gemini-2.5-flash-native-audio-latest"
-
 class GeminiLiveBridge:
     def __init__(self, objective: str = "English conversation practice", voice_name: str = "Puck"):
         self.objective = objective
@@ -30,8 +28,10 @@ class GeminiLiveBridge:
             f"2. Keep each spoken response concise (usually 1 to 2 sentences) so the learner has ample space to speak. "
             f"3. Ask warm follow-up questions to keep the conversation flowing smoothly. "
             f"4. Speak clearly with natural English cadence and intonation. "
-            f"5. Start by greeting the learner and inviting them to speak about '{self.objective}'."
+            f"5. Start by greeting the learner warmly and inviting them to speak about '{self.objective}'."
         )
+
+        model_name = settings.gemini_live_model or "gemini-2.5-flash-native-audio-latest"
 
         cfg = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
@@ -40,30 +40,36 @@ class GeminiLiveBridge:
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=self.voice_name)
                 )
             ),
+            input_audio_transcription=types.AudioTranscriptionConfig(),
+            output_audio_transcription=types.AudioTranscriptionConfig(),
             system_instruction=types.Content(
                 parts=[types.Part.from_text(text=system_prompt)]
             ),
         )
 
-        self._ctx = self.client.aio.live.connect(model=LIVE_MODEL_NAME, config=cfg)
+        self._ctx = self.client.aio.live.connect(model=model_name, config=cfg)
         self.session = await self._ctx.__aenter__()
-        logger.info(f"Connected to Gemini Live session with model {LIVE_MODEL_NAME}")
+        logger.info(f"Connected to Gemini Live session with model {model_name} (Voice: {self.voice_name})")
 
     async def send_audio_chunk(self, pcm_bytes: bytes):
+        """Streams 16kHz 16-bit Mono PCM audio to Gemini Live."""
         if not self.session:
             return
-        await self.session.send(
-            input=types.LiveClientRealtimeInput(
-                media_chunks=[types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")]
-            )
+        await self.session.send_realtime_input(
+            audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")
         )
 
     async def send_text(self, text: str):
+        """Sends quiet-mode text turn to Gemini Live."""
         if not self.session:
             return
-        await self.session.send(input=text, end_of_turn=True)
+        await self.session.send_client_content(
+            turns=[types.Content(parts=[types.Part.from_text(text=text)])],
+            turn_complete=True
+        )
 
     async def receive_events(self) -> AsyncGenerator[Dict[str, Any], None]:
+        """Receives streamed events from Gemini Live session."""
         if not self.session:
             return
         try:
@@ -73,16 +79,40 @@ class GeminiLiveBridge:
                     if sc.interrupted:
                         yield {"type": "interrupted"}
 
+                    # Authoritative user input transcription from Gemini Live
+                    if sc.input_transcription and sc.input_transcription.text:
+                        yield {
+                            "type": "transcript",
+                            "speaker": "user",
+                            "text": sc.input_transcription.text,
+                            "finished": getattr(sc.input_transcription, 'finished', True)
+                        }
+
+                    # Interim progressive user input transcription
+                    if sc.interim_input_transcription and sc.interim_input_transcription.text:
+                        yield {
+                            "type": "transcript",
+                            "speaker": "user",
+                            "text": sc.interim_input_transcription.text,
+                            "is_interim": True
+                        }
+
+                    # Authoritative Toki spoken output transcription from Gemini Live
+                    if sc.output_transcription and sc.output_transcription.text:
+                        yield {
+                            "type": "transcript",
+                            "speaker": "toki",
+                            "text": sc.output_transcription.text,
+                        }
+
+                    # Model audio data chunks
                     if sc.model_turn:
                         for part in sc.model_turn.parts:
-                            if part.text:
-                                yield {
-                                    "type": "transcript",
-                                    "speaker": "toki",
-                                    "text": part.text,
-                                }
+                            # CRITICAL: Strictly ignore model internal reasoning/thought content
+                            if getattr(part, 'thought', False):
+                                continue
+
                             if part.inline_data:
-                                # Send base64 encoded 24kHz PCM audio chunk
                                 b64_audio = base64.b64encode(part.inline_data.data).decode("utf-8")
                                 yield {
                                     "type": "audio",

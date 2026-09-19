@@ -1,19 +1,19 @@
 /**
  * Gemini Live Client
  * Manages real-time bidirectional WebSocket connection to FastAPI backend.
+ * Uses Gemini Live input & output audio transcription as authoritative source.
  * Coordinates PCMAudioRecorder (mic input) and PCMAudioPlayer (streamed 24kHz audio).
  */
 
+import { VoiceState } from '../../types';
 import { PCMAudioRecorder } from './pcmAudioRecorder';
 import { PCMAudioPlayer } from './pcmAudioPlayer';
 
-export type LiveVoiceState = 'listening' | 'thinking' | 'speaking' | 'paused';
-
 export interface GeminiLiveCallbacks {
   onTokiTranscript?: (chunk: string) => void;
-  onUserTranscript?: (text: string) => void;
+  onUserTranscript?: (text: string, isInterim?: boolean) => void;
   onTurnComplete?: () => void;
-  onStateChange?: (state: LiveVoiceState) => void;
+  onStateChange?: (state: VoiceState) => void;
   onInterrupted?: () => void;
   onMicLevel?: (level: number) => void;
   onError?: (error: string) => void;
@@ -25,11 +25,13 @@ export class GeminiLiveClient {
   private ws: WebSocket | null = null;
   private recorder: PCMAudioRecorder;
   private player: PCMAudioPlayer;
-  private state: LiveVoiceState = 'paused';
+  private state: VoiceState = 'idle';
   private callbacks: GeminiLiveCallbacks = {};
   private sessionId: number | null = null;
   private isMuted = false;
   private isConnected = false;
+  private silenceTimer: ReturnType<typeof setTimeout> | null = null;
+  private receivedGeminiInputTranscription = false;
 
   constructor(callbacks: GeminiLiveCallbacks = {}) {
     this.callbacks = callbacks;
@@ -50,21 +52,22 @@ export class GeminiLiveClient {
     this.callbacks = callbacks;
   }
 
-  private setState(newState: LiveVoiceState) {
+  private setState(newState: VoiceState) {
+    if (this.state === newState) return;
     this.state = newState;
     this.callbacks.onStateChange?.(newState);
   }
 
-  getState(): LiveVoiceState {
+  getState(): VoiceState {
     return this.state;
   }
 
   async connect(sessionId: number): Promise<void> {
     this.sessionId = sessionId;
     this.disconnect();
+    this.receivedGeminiInputTranscription = false;
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // Use host or configured backend URL
     const backendHost = import.meta.env.VITE_API_BASE_URL
       ? import.meta.env.VITE_API_BASE_URL.replace(/^http/, 'ws')
       : `${protocol}//${window.location.hostname}:8000`;
@@ -93,8 +96,9 @@ export class GeminiLiveClient {
             } else if (msg.type === 'transcript') {
               if (msg.speaker === 'toki') {
                 this.callbacks.onTokiTranscript?.(msg.text);
-              } else {
-                this.callbacks.onUserTranscript?.(msg.text);
+              } else if (msg.speaker === 'user') {
+                this.receivedGeminiInputTranscription = true;
+                this.callbacks.onUserTranscript?.(msg.text, msg.is_interim);
               }
             } else if (msg.type === 'interrupted') {
               this.player.stop();
@@ -117,6 +121,7 @@ export class GeminiLiveClient {
 
         this.ws.onerror = (err) => {
           console.warn('WebSocket connection error:', err);
+          this.setState('error');
           this.callbacks.onError?.('Failed to connect to Live session');
           reject(err);
         };
@@ -129,6 +134,7 @@ export class GeminiLiveClient {
           this.callbacks.onClosed?.();
         };
       } catch (err) {
+        this.setState('error');
         reject(err);
       }
     });
@@ -144,14 +150,38 @@ export class GeminiLiveClient {
         },
         onVolumeChange: (vol) => {
           this.callbacks.onMicLevel?.(vol);
-          // Client-side instant barge-in detection: if user speaks loudly while Toki is playing audio, cut Toki's audio
-          if (vol > 0.35 && this.player.getIsPlaying()) {
+
+          if (this.isMuted) return;
+
+          // Instant Barge-In detection: if user speaks while Toki is playing, interrupt immediately
+          if (vol > 0.25 && this.player.getIsPlaying()) {
             this.player.stop();
-            this.setState('listening');
+            this.setState('user_speaking');
+            return;
+          }
+
+          // Visual Voice State Transitions based on acoustic activity
+          if (vol > 0.08) {
+            if (this.silenceTimer) {
+              clearTimeout(this.silenceTimer);
+              this.silenceTimer = null;
+            }
+            if (!this.player.getIsPlaying() && this.state !== 'user_speaking') {
+              this.setState('user_speaking');
+            }
+          } else if (this.state === 'user_speaking' && !this.silenceTimer) {
+            // User paused speaking: wait 700ms before switching to thinking/listening
+            this.silenceTimer = setTimeout(() => {
+              this.silenceTimer = null;
+              if (this.state === 'user_speaking') {
+                this.setState('thinking');
+              }
+            }, 700);
           }
         },
         onError: (err) => {
           console.warn('Mic recorder error:', err);
+          this.setState('error');
         },
       });
 
@@ -160,10 +190,15 @@ export class GeminiLiveClient {
       }
     } catch (err) {
       console.warn('Could not start microphone:', err);
+      this.setState('error');
     }
   }
 
   private stopMicRecording() {
+    if (this.silenceTimer) {
+      clearTimeout(this.silenceTimer);
+      this.silenceTimer = null;
+    }
     this.recorder.stop();
   }
 
@@ -173,6 +208,17 @@ export class GeminiLiveClient {
       this.player.stop();
       this.setState('thinking');
       this.ws.send(JSON.stringify({ type: 'text', text: text.trim() }));
+    }
+  }
+
+  /**
+   * EXPLICIT FALLBACK STT HANDLER:
+   * Only called if client-side fallback STT is explicitly active and Gemini Live input transcription is unavailable.
+   */
+  sendFallbackUserTranscript(text: string): void {
+    if (!text.trim() || this.receivedGeminiInputTranscription) return;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'user_transcript', text: text.trim() }));
     }
   }
 
@@ -206,6 +252,6 @@ export class GeminiLiveClient {
       this.ws = null;
     }
     this.isConnected = false;
-    this.setState('paused');
+    this.setState('idle');
   }
 }

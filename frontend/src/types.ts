@@ -1,6 +1,6 @@
 export type NavTab = 'home' | 'practice' | 'progress' | 'profile';
 
-export type VoiceState = 'listening' | 'thinking' | 'speaking' | 'paused';
+export type VoiceState = 'idle' | 'listening' | 'user_speaking' | 'thinking' | 'speaking' | 'paused' | 'error';
 
 export interface PracticeMode {
   id: string;

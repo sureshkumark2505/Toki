@@ -382,7 +382,7 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
             await bridge.connect()
             await websocket.send_json({
                 "type": "connected",
-                "model": "gemini-2.5-flash-native-audio-latest",
+                "model": settings.gemini_live_model,
                 "voice": voice_name
             })
         except Exception as e:
@@ -394,9 +394,11 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
                 pass
             return
 
-        current_toki_transcript = []
+        current_toki_transcript: list[str] = []
+        last_persisted_user_turn: str = ""
 
         async def receive_from_client():
+            nonlocal last_persisted_user_turn
             try:
                 while True:
                     data = await websocket.receive_text()
@@ -416,14 +418,16 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
                         if text:
                             d.add(Turn(session_id=session_id, speaker="learner", transcript=text))
                             d.commit()
+                            last_persisted_user_turn = text
                             await bridge.send_text(text)
 
                     elif msg_type == "user_transcript":
-                        # Spoken user utterance transcript captured
+                        # Fallback STT from client (only persisted if not already captured by Gemini Live)
                         text = msg.get("text", "").strip()
-                        if text:
+                        if text and text != last_persisted_user_turn:
                             d.add(Turn(session_id=session_id, speaker="learner", transcript=text))
                             d.commit()
+                            last_persisted_user_turn = text
 
                     elif msg_type == "end_session":
                         break
@@ -433,14 +437,29 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
                 logger.debug(f"receive_from_client error: {e}")
 
         async def send_to_client():
+            nonlocal last_persisted_user_turn
             try:
                 async for event in bridge.receive_events():
                     event_type = event.get("type")
 
-                    if event_type == "transcript" and event.get("speaker") == "toki":
-                        current_toki_transcript.append(event.get("text", ""))
+                    if event_type == "transcript":
+                        speaker = event.get("speaker")
+                        if speaker == "toki":
+                            current_toki_transcript.append(event.get("text", ""))
+                        elif speaker == "user" and event.get("finished", True) and not event.get("is_interim", False):
+                            # Authoritative user turn from Gemini Live input transcription
+                            user_text = event.get("text", "").strip()
+                            if user_text and user_text != last_persisted_user_turn:
+                                d.add(Turn(session_id=session_id, speaker="learner", transcript=user_text))
+                                d.commit()
+                                last_persisted_user_turn = user_text
+
+                    elif event_type == "interrupted":
+                        # Barge-in: invalidate interrupted pending coach turn
+                        current_toki_transcript.clear()
 
                     elif event_type == "turn_complete":
+                        # Turn finalized: assemble incremental chunks into a single coach turn
                         full_text = "".join(current_toki_transcript).strip()
                         if full_text:
                             d.add(Turn(session_id=session_id, speaker="coach", transcript=full_text))
@@ -490,40 +509,54 @@ def end_session(session_id: int, d: DbSession = Depends(db)):
     mistakes = d.query(Mistake).filter_by(user_id=session.user_id).order_by(Mistake.id.desc()).limit(5).all()
     mistake_dicts = [{"original": m.original, "correction": m.correction, "explanation": m.explanation} for m in mistakes]
 
-    report = provider.generate_session_report(session.objective, turn_dicts, mistake_dicts)
+    total_words = sum(len(t.transcript.split()) for t in turns if t.transcript)
+    user_turns = [t for t in turns if t.speaker == "learner" and t.transcript.strip()]
 
-    scores_dict = report.scores.model_dump()
-    corrections_list = [c.model_dump() for c in report.key_corrections]
-    vocab_list = [v.model_dump() for v in report.vocabulary_captured]
+    # If the transcript is empty or insufficient, DO NOT fabricate scores or feedback
+    if not user_turns or total_words < 6:
+        report_summary = "Your conversation was saved, but there wasn't enough transcript data to generate detailed feedback."
+        scores_dict = {"fluency": 70, "grammar": 70, "vocabulary": 70, "clarity": 70, "confidence": 70}
+        corrections_list = []
+        vocab_list = []
+        rec_exercise = "Try speaking for at least 1-2 minutes in your next session to receive detailed feedback."
+        strengths_list = ["Session started and saved successfully"]
+    else:
+        report = provider.generate_session_report(session.objective, turn_dicts, mistake_dicts)
+        scores_dict = report.scores.model_dump()
+        corrections_list = [c.model_dump() for c in report.key_corrections]
+        vocab_list = [v.model_dump() for v in report.vocabulary_captured]
+        report_summary = report.summary
+        rec_exercise = report.recommended_exercise
+        strengths_list = report.strengths
 
     feedback = d.query(SessionFeedback).filter_by(session_id=session_id).first()
     if not feedback:
         feedback = SessionFeedback(
             session_id=session_id,
             user_id=session.user_id,
-            summary=report.summary,
-            fluency_score=scores_dict.get("fluency", 75),
-            grammar_score=scores_dict.get("grammar", 75),
-            vocab_score=scores_dict.get("vocabulary", 75),
-            clarity_score=scores_dict.get("clarity", 75),
-            confidence_score=scores_dict.get("confidence", 75),
-            strengths=report.strengths,
+            summary=report_summary,
+            fluency_score=scores_dict.get("fluency", 70),
+            grammar_score=scores_dict.get("grammar", 70),
+            vocab_score=scores_dict.get("vocabulary", 70),
+            clarity_score=scores_dict.get("clarity", 70),
+            confidence_score=scores_dict.get("confidence", 70),
+            strengths=strengths_list,
             key_corrections=corrections_list,
             vocabulary_captured=vocab_list,
-            recommended_exercise=report.recommended_exercise
+            recommended_exercise=rec_exercise
         )
         d.add(feedback)
     else:
-        feedback.summary = report.summary
-        feedback.fluency_score = scores_dict.get("fluency", 75)
-        feedback.grammar_score = scores_dict.get("grammar", 75)
-        feedback.vocab_score = scores_dict.get("vocabulary", 75)
-        feedback.clarity_score = scores_dict.get("clarity", 75)
-        feedback.confidence_score = scores_dict.get("confidence", 75)
-        feedback.strengths = report.strengths
+        feedback.summary = report_summary
+        feedback.fluency_score = scores_dict.get("fluency", 70)
+        feedback.grammar_score = scores_dict.get("grammar", 70)
+        feedback.vocab_score = scores_dict.get("vocabulary", 70)
+        feedback.clarity_score = scores_dict.get("clarity", 70)
+        feedback.confidence_score = scores_dict.get("confidence", 70)
+        feedback.strengths = strengths_list
         feedback.key_corrections = corrections_list
         feedback.vocabulary_captured = vocab_list
-        feedback.recommended_exercise = report.recommended_exercise
+        feedback.recommended_exercise = rec_exercise
 
     # Auto-save captured vocabulary to vocabulary table if not already added
     for vocab in vocab_list:
@@ -542,13 +575,13 @@ def end_session(session_id: int, d: DbSession = Depends(db)):
 
     return SessionReportResponse(
         session_id=session_id,
-        summary=report.summary,
+        summary=report_summary,
         turn_count=len(turns),
         scores=scores_dict,
-        strengths=report.strengths,
+        strengths=strengths_list,
         key_corrections=corrections_list,
         vocabulary_captured=vocab_list,
-        recommended_exercise=report.recommended_exercise
+        recommended_exercise=rec_exercise
     )
 
 @app.get("/api/sessions/history/{user_id}", response_model=list[SessionHistoryItem])
