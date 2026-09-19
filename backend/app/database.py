@@ -2,8 +2,22 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from .config import settings
 
-connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
-engine = create_engine(settings.database_url, connect_args=connect_args)
+is_sqlite = settings.database_url.startswith("sqlite")
+
+if is_sqlite:
+    engine = create_engine(
+        settings.database_url,
+        connect_args={"check_same_thread": False}
+    )
+else:
+    engine = create_engine(
+        settings.database_url,
+        pool_pre_ping=True,
+        pool_recycle=300,
+        pool_size=10,
+        max_overflow=20
+    )
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 class Base(DeclarativeBase):
@@ -13,7 +27,7 @@ def init_db():
     from . import models
     Base.metadata.create_all(bind=engine)
     # Lightweight SQLite column schema migration
-    if settings.database_url.startswith("sqlite"):
+    if is_sqlite:
         with engine.connect() as conn:
             inspector = inspect(engine)
             if "users" in inspector.get_table_names():
@@ -42,9 +56,50 @@ def init_db():
                         conn.execute(text(f"ALTER TABLE mistakes ADD COLUMN {col_name} {col_def}"))
                 conn.commit()
 
-
-    # Seed initial scenarios if scenarios table is empty
+    # Seed initial user if users table is empty
     with SessionLocal() as db_sess:
+        if db_sess.query(models.User).count() == 0:
+            default_user = models.User(
+                name="Learner",
+                native_language="English & Tamil",
+                goal="Daily Fluency & Spoken Confidence",
+                daily_minutes=10,
+                xp=0,
+                streak_days=0,
+                last_practice_date="",
+                badges=[]
+            )
+            db_sess.add(default_user)
+            db_sess.commit()
+            db_sess.refresh(default_user)
+
+            # Create initial user settings and learning profile
+            db_sess.add(models.UserSettings(
+                user_id=default_user.id,
+                coach_voice="Calm British (Neutral UK)",
+                speech_pace=1.0,
+                correction_style="Gentle & Encouraging",
+                explanation_language="English & Tamil",
+                audio_retention_days=7,
+                sound_effects_enabled=True
+            ))
+            db_sess.add(models.LearningProfile(
+                user_id=default_user.id,
+                level="Intermediate (B1/B2)",
+                strengths=["Eagerness to speak", "Good vocabulary comprehension"],
+                weaknesses=["Past tense consistency", "Spontaneous phrasing"],
+                baseline_scores={
+                    "fluency": 75,
+                    "grammar": 72,
+                    "vocabulary": 78,
+                    "clarity": 75,
+                    "listening": 80,
+                    "confidence": 70
+                }
+            ))
+            db_sess.commit()
+
+        # Seed initial scenarios if scenarios table is empty
         if db_sess.query(models.Scenario).count() == 0:
             seed_scenarios = [
                 models.Scenario(

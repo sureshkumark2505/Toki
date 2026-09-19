@@ -2,6 +2,10 @@
 __pycache__/
 *.pyc
 .next/
+dist/
 node_modules/
 coach.db
+*.db
+.pytest_cache/
+*.tsbuildinfo
 

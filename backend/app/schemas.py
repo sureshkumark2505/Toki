@@ -8,6 +8,37 @@ class Onboard(BaseModel):
     goal: str = "Communication"
     daily_minutes: int = Field(default=20, ge=10, le=45)
 
+class UserProfileResponse(BaseModel):
+    id: int
+    name: str
+    native_language: str
+    goal: str
+    daily_minutes: int
+    xp: int
+    streak_days: int
+    target_level: str
+    created_at: str | None = None
+
+class UserProfileUpdate(BaseModel):
+    name: str | None = None
+    native_language: str | None = None
+    goal: str | None = None
+    daily_minutes: int | None = None
+    target_level: str | None = None
+
+class SessionHistoryItem(BaseModel):
+    id: int
+    kind: str
+    objective: str
+    started_at: str
+    ended_at: str | None = None
+    duration_minutes: int
+    turn_count: int
+    fluency_score: int
+    grammar_score: int
+    summary: str
+    strengths: list[str] = Field(default_factory=list)
+
 class StartSession(BaseModel):
     user_id: int
     kind: Literal["guided", "free_speaking", "scenario", "interview"] = "guided"

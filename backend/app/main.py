@@ -1,5 +1,9 @@
+import json
+import asyncio
+import base64
+import logging
 from datetime import datetime, date, timedelta
-from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi import FastAPI, HTTPException, Depends, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session as DbSession
 from .config import settings
@@ -9,7 +13,7 @@ from .models import (
     Scenario, InterviewAttempt, ListeningExercise, DictationAttempt, ProgressSnapshot, UserSettings
 )
 from .schemas import (
-    Onboard, StartSession, CoachTurn, CoachReply, AssessmentComplete, AssessmentResult, PlanResult,
+    Onboard, UserProfileResponse, UserProfileUpdate, SessionHistoryItem, StartSession, CoachTurn, CoachReply, AssessmentComplete, AssessmentResult, PlanResult,
     TranslationPrompt, TranslationEvaluationRequest, TranslationEvaluationResult,
     VocabularyItem, VocabularyCreate, ReviewItem, ReviewAnswer, ReviewResult, SessionReportResponse,
     ScenarioItem, StartScenarioRequest, StartScenarioResponse, ScenarioTurnResponse, ScenarioReportResponse,
@@ -22,6 +26,10 @@ from .schemas import (
     UserSettingsResponse, UserSettingsUpdate, UserDataExportResponse, SystemMetricsResponse
 )
 from .providers.ai import provider
+from .providers.live import GeminiLiveBridge
+
+logger = logging.getLogger("api_main")
+
 
 init_db()
 
@@ -47,7 +55,7 @@ def db():
 def health():
     return {"status": "ok", "gemini_configured": bool(settings.gemini_api_key)}
 
-# ----------------- ONBOARDING -----------------
+# ----------------- ONBOARDING & USER PROFILE -----------------
 @app.post("/api/onboarding")
 def onboarding(payload: Onboard, d: DbSession = Depends(db)):
     user = User(**payload.model_dump())
@@ -55,6 +63,77 @@ def onboarding(payload: Onboard, d: DbSession = Depends(db)):
     d.commit()
     d.refresh(user)
     return {"user_id": user.id}
+
+@app.get("/api/user/{user_id}", response_model=UserProfileResponse)
+def get_user_profile(user_id: int, d: DbSession = Depends(db)):
+    user = d.get(User, user_id)
+    if not user:
+        # Auto-create default user if missing
+        user = User(
+            id=user_id,
+            name="Learner",
+            native_language="English & Tamil",
+            goal="Daily Fluency & Spoken Confidence",
+            daily_minutes=10,
+            xp=0,
+            streak_days=0,
+            last_practice_date="",
+            badges=[]
+        )
+        d.add(user)
+        d.commit()
+        d.refresh(user)
+
+    profile = d.query(LearningProfile).filter_by(user_id=user_id).first()
+    return UserProfileResponse(
+        id=user.id,
+        name=user.name or "Learner",
+        native_language=user.native_language or "English & Tamil",
+        goal=user.goal or "Daily Fluency",
+        daily_minutes=user.daily_minutes or 10,
+        xp=user.xp or 0,
+        streak_days=user.streak_days or 0,
+        target_level=profile.level if profile and profile.level else "Intermediate (B1/B2)",
+        created_at=user.created_at.isoformat() if user.created_at else None
+    )
+
+@app.put("/api/user/{user_id}", response_model=UserProfileResponse)
+def update_user_profile(user_id: int, payload: UserProfileUpdate, d: DbSession = Depends(db)):
+    user = d.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    if payload.name is not None and payload.name.strip():
+        user.name = payload.name.strip()
+    if payload.native_language is not None and payload.native_language.strip():
+        user.native_language = payload.native_language.strip()
+    if payload.goal is not None and payload.goal.strip():
+        user.goal = payload.goal.strip()
+    if payload.daily_minutes is not None:
+        user.daily_minutes = payload.daily_minutes
+
+    profile = d.query(LearningProfile).filter_by(user_id=user_id).first()
+    if payload.target_level is not None and payload.target_level.strip():
+        if not profile:
+            profile = LearningProfile(user_id=user_id, level=payload.target_level.strip())
+            d.add(profile)
+        else:
+            profile.level = payload.target_level.strip()
+
+    d.commit()
+    d.refresh(user)
+
+    return UserProfileResponse(
+        id=user.id,
+        name=user.name,
+        native_language=user.native_language,
+        goal=user.goal,
+        daily_minutes=user.daily_minutes,
+        xp=user.xp or 0,
+        streak_days=user.streak_days or 0,
+        target_level=profile.level if profile and profile.level else "Intermediate (B1/B2)",
+        created_at=user.created_at.isoformat() if user.created_at else None
+    )
 
 # ----------------- ASSESSMENT -----------------
 ASSESSMENT_PROMPTS = [
@@ -259,6 +338,121 @@ def turn(session_id: int, payload: CoachTurn, d: DbSession = Depends(db)):
     d.commit()
     return result
 
+# ----------------- GEMINI LIVE REAL-TIME AUDIO WEBSOCKET -----------------
+@app.websocket("/api/ws/live/{session_id}")
+async def websocket_live_session(websocket: WebSocket, session_id: int):
+    await websocket.accept()
+    d = SessionLocal()
+    bridge: GeminiLiveBridge | None = None
+    try:
+        session = d.get(Session, session_id)
+        if not session or session.ended_at:
+            await websocket.send_json({"type": "error", "message": "Active session not found"})
+            await websocket.close()
+            return
+
+        user_settings = d.query(UserSettings).filter_by(user_id=session.user_id).first()
+        voice_name = "Puck"
+        if user_settings and user_settings.voice_accent:
+            accent = user_settings.voice_accent.lower()
+            if "uk" in accent or "british" in accent:
+                voice_name = "Aoede"
+            elif "australian" in accent:
+                voice_name = "Kore"
+            elif "us" in accent or "american" in accent:
+                voice_name = "Puck"
+
+        bridge = GeminiLiveBridge(objective=session.objective, voice_name=voice_name)
+        try:
+            await bridge.connect()
+            await websocket.send_json({
+                "type": "connected",
+                "model": "gemini-2.5-flash-native-audio-latest",
+                "voice": voice_name
+            })
+        except Exception as e:
+            logger.warning(f"Failed to connect to Gemini Live: {e}")
+            await websocket.send_json({"type": "error", "message": f"Gemini Live connection failed: {str(e)}"})
+            await websocket.close()
+            return
+
+        current_toki_transcript = []
+
+        async def receive_from_client():
+            try:
+                while True:
+                    data = await websocket.receive_text()
+                    msg = json.loads(data)
+                    msg_type = msg.get("type")
+
+                    if msg_type == "audio":
+                        # Base64 PCM 16kHz 16-bit Mono
+                        b64_data = msg.get("data", "")
+                        if b64_data:
+                            pcm_bytes = base64.b64decode(b64_data)
+                            await bridge.send_audio_chunk(pcm_bytes)
+
+                    elif msg_type == "text":
+                        # Quiet mode text prompt
+                        text = msg.get("text", "").strip()
+                        if text:
+                            d.add(Turn(session_id=session_id, speaker="learner", transcript=text))
+                            d.commit()
+                            await bridge.send_text(text)
+
+                    elif msg_type == "user_transcript":
+                        # Spoken user utterance transcript captured
+                        text = msg.get("text", "").strip()
+                        if text:
+                            d.add(Turn(session_id=session_id, speaker="learner", transcript=text))
+                            d.commit()
+
+                    elif msg_type == "end_session":
+                        break
+            except WebSocketDisconnect:
+                pass
+            except Exception as e:
+                logger.debug(f"receive_from_client error: {e}")
+
+        async def send_to_client():
+            try:
+                async for event in bridge.receive_events():
+                    event_type = event.get("type")
+
+                    if event_type == "transcript" and event.get("speaker") == "toki":
+                        current_toki_transcript.append(event.get("text", ""))
+
+                    elif event_type == "turn_complete":
+                        full_text = "".join(current_toki_transcript).strip()
+                        if full_text:
+                            d.add(Turn(session_id=session_id, speaker="coach", transcript=full_text))
+                            d.commit()
+                            current_toki_transcript.clear()
+
+                    await websocket.send_json(event)
+            except WebSocketDisconnect:
+                pass
+            except Exception as e:
+                logger.debug(f"send_to_client error: {e}")
+
+        client_task = asyncio.create_task(receive_from_client())
+        live_task = asyncio.create_task(send_to_client())
+
+        done, pending = await asyncio.wait(
+            [client_task, live_task],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        for p in pending:
+            p.cancel()
+
+    except Exception as e:
+        logger.warning(f"WebSocket session error: {e}")
+    finally:
+        if bridge:
+            await bridge.close()
+        d.close()
+
+
 # ----------------- SESSION FEEDBACK REPORT (PHASE 4) -----------------
 @app.post("/api/sessions/{session_id}/end", response_model=SessionReportResponse)
 def end_session(session_id: int, d: DbSession = Depends(db)):
@@ -332,6 +526,65 @@ def end_session(session_id: int, d: DbSession = Depends(db)):
         key_corrections=corrections_list,
         vocabulary_captured=vocab_list,
         recommended_exercise=report.recommended_exercise
+    )
+
+@app.get("/api/sessions/history/{user_id}", response_model=list[SessionHistoryItem])
+def get_session_history(user_id: int, limit: int = 10, d: DbSession = Depends(db)):
+    sessions = d.query(Session).filter_by(user_id=user_id).order_by(Session.id.desc()).limit(limit).all()
+    history_items = []
+    for s in sessions:
+        feedback = d.query(SessionFeedback).filter_by(session_id=s.id).first()
+        turn_count = d.query(Turn).filter_by(session_id=s.id).count()
+
+        duration_mins = 1
+        if s.started_at and s.ended_at:
+            delta = (s.ended_at - s.started_at).total_seconds()
+            duration_mins = max(1, round(delta / 60))
+        elif turn_count > 0:
+            duration_mins = max(1, round(turn_count * 0.75))
+
+        history_items.append(SessionHistoryItem(
+            id=s.id,
+            kind=s.kind or "guided",
+            objective=s.objective or "General Practice",
+            started_at=s.started_at.isoformat() if s.started_at else "",
+            ended_at=s.ended_at.isoformat() if s.ended_at else None,
+            duration_minutes=duration_mins,
+            turn_count=turn_count,
+            fluency_score=feedback.fluency_score if feedback else 75,
+            grammar_score=feedback.grammar_score if feedback else 75,
+            summary=feedback.summary if feedback else "Completed practice session with Toki.",
+            strengths=feedback.strengths if feedback and feedback.strengths else []
+        ))
+    return history_items
+
+@app.get("/api/sessions/{session_id}/feedback", response_model=SessionReportResponse)
+def get_session_feedback(session_id: int, d: DbSession = Depends(db)):
+    session = d.get(Session, session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+
+    feedback = d.query(SessionFeedback).filter_by(session_id=session_id).first()
+    turns = d.query(Turn).filter_by(session_id=session_id).all()
+
+    if not feedback:
+        raise HTTPException(404, "No feedback report recorded for this session yet")
+
+    return SessionReportResponse(
+        session_id=session_id,
+        summary=feedback.summary,
+        turn_count=len(turns),
+        scores={
+            "fluency": feedback.fluency_score,
+            "grammar": feedback.grammar_score,
+            "vocabulary": feedback.vocab_score,
+            "clarity": feedback.clarity_score,
+            "confidence": feedback.confidence_score
+        },
+        strengths=feedback.strengths or [],
+        key_corrections=feedback.key_corrections or [],
+        vocabulary_captured=feedback.vocabulary_captured or [],
+        recommended_exercise=feedback.recommended_exercise or ""
     )
 
 # ----------------- MISTAKE MEMORY & SPACED REPETITION (PHASE 4) -----------------
@@ -1007,12 +1260,12 @@ def get_progress_dashboard(user_id: int, d: DbSession = Depends(db)):
         }
     else:
         current_scores = {
-            "fluency": baseline.get("fluency", 75) + 3,
-            "grammar": baseline.get("grammar", 75) + 2,
-            "vocabulary": baseline.get("vocabulary", 75) + 4,
-            "clarity": baseline.get("clarity", 75) + 3,
-            "listening": baseline.get("listening", 75) + 5,
-            "confidence": baseline.get("confidence", 75) + 4
+            "fluency": baseline.get("fluency", 75),
+            "grammar": baseline.get("grammar", 72),
+            "vocabulary": baseline.get("vocabulary", 78),
+            "clarity": baseline.get("clarity", 75),
+            "listening": baseline.get("listening", 80),
+            "confidence": baseline.get("confidence", 70)
         }
 
     score_changes = {
@@ -1021,38 +1274,45 @@ def get_progress_dashboard(user_id: int, d: DbSession = Depends(db)):
 
     sessions_count = d.query(Session).filter_by(user_id=user_id).count()
     turns_count = d.query(Turn).join(Session).filter(Session.user_id == user_id, Turn.speaker == "learner").count()
-    speaking_minutes = max(5, int(turns_count * 0.8))
+    speaking_minutes = round(turns_count * 0.75) if turns_count > 0 else 0
 
     mistakes_count = d.query(Mistake).filter_by(user_id=user_id).count()
     words_mastered = d.query(Vocabulary).filter_by(user_id=user_id).filter(Vocabulary.mastery >= 50).count()
 
     overall_score = sum(current_scores.values()) // max(1, len(current_scores))
 
-    # Determine earned badges based on activity
-    earned_badges = [
-        AVAILABLE_BADGES[0],  # First Words
-    ]
-    if (user.streak_days or 1) >= 3:
-        earned_badges.append(AVAILABLE_BADGES[1])
+    # Determine earned badges based on actual learner achievements
+    earned_badges = [AVAILABLE_BADGES[0]]  # Welcome / First Steps
+    if turns_count >= 1:
+        earned_badges.append(AVAILABLE_BADGES[0])
+    if (user.streak_days or 0) >= 3:
+        earned_badges.append(AVAILABLE_BADGES[1])  # 3-Day Dynamo
     if d.query(Vocabulary).filter_by(user_id=user_id).count() >= 3:
-        earned_badges.append(AVAILABLE_BADGES[2])
+        earned_badges.append(AVAILABLE_BADGES[2])  # Word Smith
     if d.query(InterviewAttempt).filter_by(user_id=user_id).count() >= 1:
-        earned_badges.append(AVAILABLE_BADGES[3])
+        earned_badges.append(AVAILABLE_BADGES[3])  # Interview Pro
     if d.query(DictationAttempt).filter(DictationAttempt.user_id == user_id, DictationAttempt.accuracy_score >= 80).count() >= 1:
-        earned_badges.append(AVAILABLE_BADGES[4])
-    earned_badges.append(AVAILABLE_BADGES[5])
+        earned_badges.append(AVAILABLE_BADGES[4])  # Sharp Ears
+
+    # Unique badges list
+    unique_badge_ids = set()
+    deduped_badges = []
+    for b in earned_badges:
+        if b["id"] not in unique_badge_ids:
+            unique_badge_ids.add(b["id"])
+            deduped_badges.append({"name": b["name"], "icon": b["icon"], "desc": b["desc"]})
 
     return ProgressDashboardResponse(
         overall_score=overall_score,
-        level=profile.level if profile else "Intermediate (B1)",
+        level=profile.level if profile else "Intermediate (B1/B2)",
         current_scores=current_scores,
         baseline_scores=baseline,
         score_changes=score_changes,
         total_speaking_minutes=speaking_minutes,
         sessions_completed=sessions_count,
-        streak_days=user.streak_days or 1,
-        xp=user.xp or 150,
-        badges=[{"name": b["name"], "icon": b["icon"], "desc": b["desc"]} for b in earned_badges],
+        streak_days=user.streak_days or 0,
+        xp=user.xp or 100,
+        badges=deduped_badges,
         recurring_mistakes_count=mistakes_count,
         words_mastered_count=words_mastered
     )
