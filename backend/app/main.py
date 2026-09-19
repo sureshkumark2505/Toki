@@ -387,8 +387,11 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
             })
         except Exception as e:
             logger.warning(f"Failed to connect to Gemini Live: {e}")
-            await websocket.send_json({"type": "error", "message": f"Gemini Live connection failed: {str(e)}"})
-            await websocket.close()
+            try:
+                await websocket.send_json({"type": "error", "message": f"Gemini Live connection failed: {str(e)}"})
+                await websocket.close()
+            except Exception:
+                pass
             return
 
         current_toki_transcript = []
@@ -424,7 +427,7 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
 
                     elif msg_type == "end_session":
                         break
-            except WebSocketDisconnect:
+            except (WebSocketDisconnect, RuntimeError):
                 pass
             except Exception as e:
                 logger.debug(f"receive_from_client error: {e}")
@@ -444,8 +447,11 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
                             d.commit()
                             current_toki_transcript.clear()
 
-                    await websocket.send_json(event)
-            except WebSocketDisconnect:
+                    try:
+                        await websocket.send_json(event)
+                    except (WebSocketDisconnect, RuntimeError):
+                        break
+            except (WebSocketDisconnect, RuntimeError):
                 pass
             except Exception as e:
                 logger.debug(f"send_to_client error: {e}")
@@ -460,6 +466,8 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
         for p in pending:
             p.cancel()
 
+    except (WebSocketDisconnect, RuntimeError):
+        pass
     except Exception as e:
         logger.warning(f"WebSocket session error: {e}")
     finally:
