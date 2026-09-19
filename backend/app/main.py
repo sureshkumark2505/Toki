@@ -386,9 +386,18 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
                 "voice": voice_name
             })
         except Exception as e:
-            logger.warning(f"Failed to connect to Gemini Live: {e}")
+            logger.exception(
+                "WebSocket handler failed to connect to Gemini Live. session_id=%s model=%s type=%s repr=%r",
+                session_id,
+                settings.gemini_live_model,
+                type(e).__name__,
+                e,
+            )
             try:
-                await websocket.send_json({"type": "error", "message": f"Gemini Live connection failed: {str(e)}"})
+                await websocket.send_json({
+                    "type": "error",
+                    "message": f"Gemini Live connection failed ({type(e).__name__}): {repr(e)}"
+                })
                 await websocket.close()
             except Exception:
                 pass

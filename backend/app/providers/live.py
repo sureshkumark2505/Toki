@@ -47,9 +47,18 @@ class GeminiLiveBridge:
             ),
         )
 
-        self._ctx = self.client.aio.live.connect(model=model_name, config=cfg)
-        self.session = await self._ctx.__aenter__()
-        logger.info(f"Connected to Gemini Live session with model {model_name} (Voice: {self.voice_name})")
+        try:
+            self._ctx = self.client.aio.live.connect(model=model_name, config=cfg)
+            self.session = await self._ctx.__aenter__()
+            logger.info(f"Connected to Gemini Live session with model {model_name} (Voice: {self.voice_name})")
+        except Exception as e:
+            logger.exception(
+                "Failed to connect to Gemini Live. model=%s type=%s repr=%r",
+                model_name,
+                type(e).__name__,
+                e,
+            )
+            raise
 
     async def send_audio_chunk(self, pcm_bytes: bytes):
         """Streams 16kHz 16-bit Mono PCM audio to Gemini Live."""
@@ -125,8 +134,12 @@ class GeminiLiveBridge:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.warning(f"Error receiving from Gemini Live session: {e}")
-            yield {"type": "error", "message": str(e)}
+            logger.exception(
+                "Error receiving from Gemini Live session. type=%s repr=%r",
+                type(e).__name__,
+                e,
+            )
+            yield {"type": "error", "message": f"{type(e).__name__}: {str(e)}"}
 
     async def close(self):
         if self._ctx:
