@@ -20,12 +20,12 @@
 
 ## 🛠️ Technology Stack
 
-| Layer | Technologies |
-|---|---|
-| **Frontend** | React 18, TypeScript, Vite, Tailwind CSS, Web Audio API (PCM 16/24kHz streaming), Lucide & Material Symbols |
-| **Backend** | Python 3.10+, FastAPI, SQLAlchemy, WebSockets, `psycopg2-binary`, Pydantic v2 |
-| **AI Engine** | Google Gemini Multimodal Live API (`gemini-2.0-flash-exp` / `gemini-2.5-flash`), Google GenAI SDK |
-| **Database** | SQLite (Default Dev) / Supabase PostgreSQL (Production) |
+| Layer               | Technologies                                                                                                |
+| ------------------- | ----------------------------------------------------------------------------------------------------------- |
+| **Frontend**  | React 18, TypeScript, Vite, Tailwind CSS, Web Audio API (PCM 16/24kHz streaming), Lucide & Material Symbols |
+| **Backend**   | Python 3.10+, FastAPI, SQLAlchemy, WebSockets,`psycopg2-binary`, Pydantic v2                              |
+| **AI Engine** | Google Gemini Multimodal Live API (`gemini-2.0-flash-exp` / `gemini-2.5-flash`), Google GenAI SDK       |
+| **Database**  | SQLite (Default Dev) / Supabase PostgreSQL (Production)                                                     |
 
 ---
 
@@ -65,16 +65,21 @@ Toki/
 ## ⚡ Quickstart Guide
 
 ### 1. Prerequisites
+
 - **Node.js** (v18 or higher)
 - **Python** (v3.10 or higher)
 - **Google Gemini API Key** ([Get your key here](https://aistudio.google.com/app/apikey))
 
 ### 2. Configure Environment Variables
+
 Copy `.env.example` to `.env` in the root folder:
+
 ```bash
 cp .env.example .env
 ```
+
 Populate `.env` with your settings:
+
 ```env
 GEMINI_API_KEY=your_actual_gemini_api_key_here
 GEMINI_MODEL=models/gemini-2.0-flash-exp
@@ -84,6 +89,7 @@ VITE_WS_BASE_URL=ws://localhost:8000
 ```
 
 ### 3. Start Backend Server
+
 ```bash
 cd backend
 python -m venv venv
@@ -96,14 +102,17 @@ source venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
+
 API Documentation will be available at `http://localhost:8000/docs`.
 
 ### 4. Start Frontend Application
+
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
+
 Open your browser and navigate to `http://localhost:5173` (or `http://localhost:3000`).
 
 ---
@@ -113,6 +122,7 @@ Open your browser and navigate to `http://localhost:5173` (or `http://localhost:
 Toki is built with full support for Supabase PostgreSQL databases with SSL connection pooling and automatic dialect normalization.
 
 ### Option A: Automatic Table Creation
+
 1. Create a new project in [Supabase](https://supabase.com).
 2. Go to **Project Settings > Database > Connection String > URI**.
 3. Set your `DATABASE_URL` in `.env`:
@@ -122,6 +132,7 @@ Toki is built with full support for Supabase PostgreSQL databases with SSL conne
 4. Start the backend (`uvicorn app.main:app`). SQLAlchemy will automatically initialize all 14 tables and initial seeds on startup.
 
 ### Option B: Supabase SQL Editor (Instant DDL)
+
 1. Open your project on [Supabase Dashboard](https://supabase.com/dashboard).
 2. Click on **SQL Editor** in the left sidebar.
 3. Paste the contents of [`backend/supabase_schema.sql`](backend/supabase_schema.sql) and click **Run**.
@@ -132,26 +143,32 @@ Toki is built with full support for Supabase PostgreSQL databases with SSL conne
 ## 🧪 Testing & Verification
 
 ### Run Backend Tests (Pytest)
+
 ```bash
 cd backend
 python -m pytest
 ```
+
 Runs 19 integration and unit tests covering health checks, session creation, turn processing, AI feedback summaries, profile settings, and data exports.
 
 ### Run Frontend Build & TypeScript Check
+
 ```bash
 cd frontend
 npm run build
 ```
+
 Ensures 100% type safety and bundles production assets.
 
 ---
 
 ## 🔒 Privacy & Safety
+
 - **No API keys in the browser**: All AI processing, prompts, and Gemini tokens are managed securely through the backend.
 - **Full Data Ownership**: Learners can export their entire learning history as JSON or permanently wipe their account data at any time from the Profile tab.
 
 ---
 
 ## 📄 License
+
 This project is licensed under the MIT License.

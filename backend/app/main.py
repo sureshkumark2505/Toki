@@ -221,7 +221,21 @@ def today_plan(user_id: int, d: DbSession = Depends(db)):
     today_str = date.today().isoformat()
     plan = d.query(DailyPlan).filter_by(user_id=user_id, date=today_str).first()
     if not plan:
-        raise HTTPException(404, "No plan for today")
+        user = d.get(User, user_id)
+        mins = user.daily_minutes if user else 15
+        default_tasks = [
+            {"title": "Daily Warm-up: Past Tense", "kind": "Warm-up", "minutes": min(5, mins), "instruction": "Practice speaking naturally about your day using past tense verbs."},
+            {"title": "Spontaneous Conversation Flow", "kind": "Core", "minutes": max(5, mins - 5), "instruction": "Engage in continuous dialogue without pausing."},
+        ]
+        plan = DailyPlan(
+            user_id=user_id,
+            date=today_str,
+            tasks=default_tasks,
+            generated_reason="Daily fluency and active speaking consistency",
+            completed=False
+        )
+        d.add(plan)
+        d.commit()
     return {
         "id": plan.id,
         "tasks": plan.tasks,
@@ -353,8 +367,9 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
 
         user_settings = d.query(UserSettings).filter_by(user_id=session.user_id).first()
         voice_name = "Puck"
-        if user_settings and user_settings.voice_accent:
-            accent = user_settings.voice_accent.lower()
+        voice_val = getattr(user_settings, 'coach_voice', '') or getattr(user_settings, 'voice_accent', '')
+        if voice_val:
+            accent = str(voice_val).lower()
             if "uk" in accent or "british" in accent:
                 voice_name = "Aoede"
             elif "australian" in accent:

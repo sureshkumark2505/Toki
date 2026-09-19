@@ -99,9 +99,9 @@ def init_db():
             ))
             db_sess.commit()
 
-        # Seed initial scenarios if scenarios table is empty
-        if db_sess.query(models.Scenario).count() == 0:
-            seed_scenarios = [
+        # Seed initial scenarios if scenarios table has fewer than 12
+        existing_titles = {s.title for s in db_sess.query(models.Scenario.title).all()}
+        all_seed_scenarios = [
                 models.Scenario(
                     title="Client Project Scope & Timeline",
                     category="Workplace",
@@ -234,8 +234,10 @@ def init_db():
                     initial_prompt="Good morning. Please have a seat. What seems to be the trouble that brought you in today?",
                     difficulty="Medium"
                 )
-            ]
-            db_sess.add_all(seed_scenarios)
+        ]
+        new_to_add = [s for s in all_seed_scenarios if s.title not in existing_titles]
+        if new_to_add:
+            db_sess.add_all(new_to_add)
             db_sess.commit()
 
         if db_sess.query(models.ListeningExercise).count() == 0:
