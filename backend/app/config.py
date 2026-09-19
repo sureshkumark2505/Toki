@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.5-flash"
     gemini_live_model: str = "gemini-2.5-flash-native-audio-latest"
     database_url: str = "sqlite:///./coach.db"
-    cors_origins: str = "http://localhost:3000"
+    cors_origins: str = "*"
     app_env: str = "development"
 
     @field_validator("database_url", mode="after")
