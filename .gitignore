@@ -8,4 +8,7 @@ coach.db
 *.db
 .pytest_cache/
 *.tsbuildinfo
+venv/
+.venv/
+backend/venv/
 
