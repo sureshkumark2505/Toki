@@ -15,8 +15,10 @@ class Settings(BaseSettings):
     def normalize_database_url(cls, v: str) -> str:
         if not v:
             return "sqlite:///./coach.db"
-        # Supabase and Heroku often provide postgres:// instead of postgresql://
-        if v.startswith("postgres://"):
+        v = v.strip().strip("'").strip('"')
+        if v.startswith("//"):
+            v = "postgresql+psycopg2:" + v
+        elif v.startswith("postgres://"):
             v = v.replace("postgres://", "postgresql+psycopg2://", 1)
         elif v.startswith("postgresql://") and not v.startswith("postgresql+"):
             v = v.replace("postgresql://", "postgresql+psycopg2://", 1)
