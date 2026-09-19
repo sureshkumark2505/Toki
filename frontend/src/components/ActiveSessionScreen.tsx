@@ -149,11 +149,15 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
 
     liveClientRef.current = liveClient;
 
-    liveClient.connect(sessionId).catch((err) => {
-      console.warn('Failed to connect to Live session:', err);
-    });
+    // Defer connect one tick so React StrictMode's throwaway mount never opens a socket.
+    const connectTimer = setTimeout(() => {
+      liveClient.connect(sessionId).catch((err) => {
+        console.warn('Failed to connect to Live session:', err);
+      });
+    }, 0);
 
     return () => {
+      clearTimeout(connectTimer);
       liveClient.disconnect();
     };
   }, [sessionId]);

@@ -82,55 +82,57 @@ class GeminiLiveBridge:
         if not self.session:
             return
         try:
-            async for response in self.session.receive():
-                sc = response.server_content
-                if sc:
-                    if sc.interrupted:
-                        yield {"type": "interrupted"}
+            # session.receive() ends after EVERY turn_complete, so keep re-entering it
+            # for the lifetime of the connection.
+            while True:
+                got_message = False
+                async for response in self.session.receive():
+                    got_message = True
+                    sc = response.server_content
+                    if sc:
+                        if sc.interrupted:
+                            yield {"type": "interrupted"}
 
-                    # Authoritative user input transcription from Gemini Live
-                    if sc.input_transcription and sc.input_transcription.text:
-                        yield {
-                            "type": "transcript",
-                            "speaker": "user",
-                            "text": sc.input_transcription.text,
-                            "finished": getattr(sc.input_transcription, 'finished', True)
-                        }
+                        if sc.input_transcription and sc.input_transcription.text:
+                            yield {
+                                "type": "transcript",
+                                "speaker": "user",
+                                "text": sc.input_transcription.text,
+                                "finished": getattr(sc.input_transcription, "finished", True),
+                            }
 
-                    # Interim progressive user input transcription
-                    if sc.interim_input_transcription and sc.interim_input_transcription.text:
-                        yield {
-                            "type": "transcript",
-                            "speaker": "user",
-                            "text": sc.interim_input_transcription.text,
-                            "is_interim": True
-                        }
+                        if sc.interim_input_transcription and sc.interim_input_transcription.text:
+                            yield {
+                                "type": "transcript",
+                                "speaker": "user",
+                                "text": sc.interim_input_transcription.text,
+                                "is_interim": True,
+                            }
 
-                    # Authoritative Toki spoken output transcription from Gemini Live
-                    if sc.output_transcription and sc.output_transcription.text:
-                        yield {
-                            "type": "transcript",
-                            "speaker": "toki",
-                            "text": sc.output_transcription.text,
-                        }
+                        if sc.output_transcription and sc.output_transcription.text:
+                            yield {
+                                "type": "transcript",
+                                "speaker": "toki",
+                                "text": sc.output_transcription.text,
+                            }
 
-                    # Model audio data chunks
-                    if sc.model_turn:
-                        for part in sc.model_turn.parts:
-                            # CRITICAL: Strictly ignore model internal reasoning/thought content
-                            if getattr(part, 'thought', False):
-                                continue
+                        if sc.model_turn:
+                            for part in sc.model_turn.parts:
+                                if getattr(part, "thought", False):
+                                    continue
+                                if part.inline_data:
+                                    b64_audio = base64.b64encode(part.inline_data.data).decode("utf-8")
+                                    yield {
+                                        "type": "audio",
+                                        "data": b64_audio,
+                                        "mime_type": part.inline_data.mime_type,
+                                    }
 
-                            if part.inline_data:
-                                b64_audio = base64.b64encode(part.inline_data.data).decode("utf-8")
-                                yield {
-                                    "type": "audio",
-                                    "data": b64_audio,
-                                    "mime_type": part.inline_data.mime_type,
-                                }
+                        if sc.turn_complete:
+                            yield {"type": "turn_complete"}
 
-                    if sc.turn_complete:
-                        yield {"type": "turn_complete"}
+                if not got_message:
+                    break  # socket really closed; avoid a busy loop
         except asyncio.CancelledError:
             pass
         except Exception as e:

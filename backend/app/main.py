@@ -380,14 +380,9 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
         bridge = GeminiLiveBridge(objective=session.objective, voice_name=voice_name)
         try:
             await bridge.connect()
-            await websocket.send_json({
-                "type": "connected",
-                "model": settings.gemini_live_model,
-                "voice": voice_name
-            })
         except Exception as e:
             logger.exception(
-                "WebSocket handler failed to connect to Gemini Live. session_id=%s model=%s type=%s repr=%r",
+                "Failed to connect to Gemini Live. session_id=%s model=%s type=%s repr=%r",
                 session_id,
                 settings.gemini_live_model,
                 type(e).__name__,
@@ -396,11 +391,21 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
             try:
                 await websocket.send_json({
                     "type": "error",
-                    "message": f"Gemini Live connection failed ({type(e).__name__}): {repr(e)}"
+                    "message": f"Gemini Live connection failed ({type(e).__name__}): {repr(e)}",
                 })
                 await websocket.close()
             except Exception:
                 pass
+            return
+
+        try:
+            await websocket.send_json({
+                "type": "connected",
+                "model": settings.gemini_live_model,
+                "voice": voice_name,
+            })
+        except (WebSocketDisconnect, RuntimeError):
+            logger.info("Client disconnected before 'connected' was sent. session_id=%s", session_id)
             return
 
         current_toki_transcript: list[str] = []
@@ -442,8 +447,8 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
                         break
             except (WebSocketDisconnect, RuntimeError):
                 pass
-            except Exception as e:
-                logger.debug(f"receive_from_client error: {e}")
+            except Exception:
+                logger.exception("receive_from_client failed")
 
         async def send_to_client():
             nonlocal last_persisted_user_turn
@@ -481,18 +486,25 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
                         break
             except (WebSocketDisconnect, RuntimeError):
                 pass
-            except Exception as e:
-                logger.debug(f"send_to_client error: {e}")
+            except Exception:
+                logger.exception("send_to_client failed")
 
         client_task = asyncio.create_task(receive_from_client())
         live_task = asyncio.create_task(send_to_client())
 
         done, pending = await asyncio.wait(
             [client_task, live_task],
-            return_when=asyncio.FIRST_COMPLETED
+            return_when=asyncio.FIRST_COMPLETED,
         )
+        for t in done:
+            logger.info(
+                "Live session %s ending because %s task finished",
+                session_id,
+                "client" if t is client_task else "gemini",
+            )
         for p in pending:
             p.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
     except (WebSocketDisconnect, RuntimeError):
         pass
