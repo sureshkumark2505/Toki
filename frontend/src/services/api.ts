@@ -41,6 +41,10 @@ export interface BackendSessionReport {
     example: string;
   }>;
   recommended_exercise: string;
+  streak_counted?: boolean;
+  streak_days?: number;
+  xp_earned?: number;
+  practice_message?: string;
 }
 
 export interface BackendDailyPlan {

@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./coach.db"
     cors_origins: str = "*"
     app_env: str = "development"
+    streak_min_meaningful_turns: int = 4
+    streak_min_spoken_words: int = 40
+    app_timezone: str = "Asia/Kolkata"
 
     @field_validator("database_url", mode="after")
     @classmethod

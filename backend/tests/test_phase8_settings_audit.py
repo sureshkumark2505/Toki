@@ -90,7 +90,7 @@ def test_user_data_reset(test_user):
     assert db.query(Mistake).filter_by(user_id=test_user).count() == 0
     user = db.get(User, test_user)
     assert user.xp == 100
-    assert user.streak_days == 1
+    assert user.streak_days == 0
     db.close()
 
 def test_system_metrics_endpoint():

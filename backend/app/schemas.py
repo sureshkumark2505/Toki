@@ -143,6 +143,10 @@ class SessionReportResponse(BaseModel):
     key_corrections: list[dict[str, str]]
     vocabulary_captured: list[dict[str, str]]
     recommended_exercise: str
+    streak_counted: bool = False
+    streak_days: int = 0
+    xp_earned: int = 0
+    practice_message: str = ""
 
 # ----------------- PHASE 5: SCENARIOS & ROLEPLAY -----------------
 class ScenarioItem(BaseModel):

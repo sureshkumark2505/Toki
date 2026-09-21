@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef, useTransition } from 'react';
 import { TokiOrb } from './TokiOrb';
 import { VoiceState, TranscriptItem, SessionFeedbackData } from '../types';
-import { GeminiLiveClient } from '../services/voice/geminiLiveClient';
+import { GeminiLiveClient, LiveCorrection } from '../services/voice/geminiLiveClient';
 import { tokiApi, BackendSessionReport } from '../services/api';
+import { defaultVoiceService } from '../services/voice/voiceService';
 
 interface ActiveSessionScreenProps {
   sessionId?: number;
@@ -28,6 +29,8 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
   const [showKeyboardDrawer, setShowKeyboardDrawer] = useState(false);
   const [textInput, setTextInput] = useState('');
   const [isLiveConnected, setIsLiveConnected] = useState(false);
+  const [liveCorrections, setLiveCorrections] = useState<LiveCorrection[]>([]);
+  const [isPlayingCorrection, setIsPlayingCorrection] = useState(false);
   const [, startTransition] = useTransition();
 
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
@@ -142,6 +145,9 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
         currentTokiSpeechRef.current = '';
         setCurrentTokiSpeech('');
       },
+      onCorrection: (corr) => {
+        setLiveCorrections((prev) => [...prev.slice(-3), corr]);
+      },
       onError: (err) => {
         console.warn('Gemini Live error:', err);
       },
@@ -172,7 +178,7 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
         });
       });
     }
-  }, [transcripts, currentTokiSpeech, currentUserSpeech]);
+  }, [transcripts, currentTokiSpeech, currentUserSpeech, liveCorrections]);
 
   // Toggle mic button
   const handleToggleMic = () => {
@@ -180,6 +186,20 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
     const nextMuted = !isMicMuted;
     setIsMicMuted(nextMuted);
     liveClientRef.current.setMuted(nextMuted);
+  };
+
+  const handleHearCorrection = (text: string) => {
+    if (!text || isPlayingCorrection) return;
+    setIsPlayingCorrection(true);
+    defaultVoiceService.speak(
+      text,
+      { rate: 0.9, pitch: 1.0 },
+      {
+        onStart: () => setIsPlayingCorrection(true),
+        onEnd: () => setIsPlayingCorrection(false),
+        onError: () => setIsPlayingCorrection(false),
+      }
+    );
   };
 
   // End voice practice session and transition to feedback report
@@ -198,31 +218,46 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
         const report: BackendSessionReport = await tokiApi.endSession(sessionId);
 
         const primaryCorrection = report.key_corrections?.[0];
-        const improvementObj = primaryCorrection
-          ? {
-              focusTitle: primaryCorrection.explanation ? primaryCorrection.explanation.slice(0, 45) : 'Refined natural phrasing',
-              category: 'Conversational nuance',
-              insteadOf: primaryCorrection.original,
-              wrongFragment: primaryCorrection.original.split(' ')[0] || primaryCorrection.original,
-              trySaying: primaryCorrection.correction,
-              correctFragment: primaryCorrection.correction.split(' ')[0] || primaryCorrection.correction,
-              audioPronunciationText: primaryCorrection.correction,
-            }
-          : {
-              focusTitle: 'Conversational Fluency',
-              category: 'Flow & Precision',
-              insteadOf: 'No major grammatical mistakes detected in this session.',
-              wrongFragment: 'Clear',
-              trySaying: 'Continue elaborating your thoughts with compound expressions.',
-              correctFragment: 'Continue elaborating',
-              audioPronunciationText: 'Continue elaborating your thoughts with compound expressions.',
-            };
+        let improvementObj;
+
+        if (report.streak_counted === false && report.practice_message) {
+          improvementObj = {
+            focusTitle: 'Daily Streak Goal',
+            category: 'Speaking Practice',
+            insteadOf: 'Short interaction',
+            wrongFragment: 'Short',
+            trySaying: report.practice_message,
+            correctFragment: 'Practice more',
+            audioPronunciationText: report.practice_message,
+          };
+        } else if (primaryCorrection) {
+          improvementObj = {
+            focusTitle: primaryCorrection.explanation ? primaryCorrection.explanation.slice(0, 45) : 'Refined natural phrasing',
+            category: 'Conversational nuance',
+            insteadOf: primaryCorrection.original,
+            wrongFragment: primaryCorrection.original.split(' ')[0] || primaryCorrection.original,
+            trySaying: primaryCorrection.correction,
+            correctFragment: primaryCorrection.correction.split(' ')[0] || primaryCorrection.correction,
+            audioPronunciationText: primaryCorrection.correction,
+          };
+        } else {
+          improvementObj = {
+            focusTitle: 'Conversational Fluency',
+            category: 'Flow & Precision',
+            insteadOf: report.practice_message || 'Keep expressing ideas in complete spoken thoughts.',
+            wrongFragment: 'Clear',
+            trySaying: 'Continue elaborating your thoughts with compound expressions.',
+            correctFragment: 'Continue elaborating',
+            audioPronunciationText: 'Continue elaborating your thoughts with compound expressions.',
+          };
+        }
 
         const feedbackData: SessionFeedbackData = {
           sessionTitle: initialTopic || 'Spoken English Practice',
           durationMinutes: durationMins,
           wordsExchanged: totalWords,
           coachReflection:
+            report.practice_message ||
             report.summary ||
             'Great natural speaking flow throughout the session. You expressed your ideas clearly and maintained steady conversational pacing!',
           strengths: (report.strengths && report.strengths.length > 0
@@ -377,6 +412,57 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
             </div>
           </div>
         </section>
+
+        {/* Real-time Live Correction Card */}
+        {liveCorrections.length > 0 && (() => {
+          const latest = liveCorrections[liveCorrections.length - 1];
+          return (
+            <div className="mb-2 bg-[#1c2028] border border-[#ffb4ab]/30 rounded-2xl p-3 shadow-lg flex flex-col gap-2 relative animate-in fade-in slide-in-from-bottom-2 duration-300">
+              <div className="flex items-center justify-between border-b border-[#3e484f]/20 pb-1.5">
+                <div className="flex items-center gap-1.5 text-[#ffb4ab]">
+                  <span className="material-symbols-outlined text-[16px]">spellcheck</span>
+                  <span className="text-[11px] font-bold uppercase tracking-wider font-['Plus_Jakarta_Sans']">
+                    Instant Coach Feedback
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleHearCorrection(latest.corrected)}
+                  className="flex items-center gap-1 text-[11px] text-[#8ed5ff] bg-[#262a33] hover:bg-[#31353e] px-2 py-0.5 rounded-full border border-[#3e484f]/30 active:scale-95 transition-all cursor-pointer"
+                >
+                  <span className="material-symbols-outlined text-[14px]">
+                    {isPlayingCorrection ? 'graphic_eq' : 'volume_up'}
+                  </span>
+                  <span>{isPlayingCorrection ? 'Playing...' : 'Hear target'}</span>
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 gap-1.5 text-[12px]">
+                <div className="flex items-start gap-1.5 text-[#ffb4ab]">
+                  <span className="font-semibold text-[#87929a] min-w-[65px]">You said:</span>
+                  <span className="italic opacity-90">“{latest.original}”</span>
+                </div>
+                <div className="flex items-start gap-1.5 text-[#8ed5ff]">
+                  <span className="font-semibold text-[#38bdf8] min-w-[65px]">Try saying:</span>
+                  <span className="font-medium text-[#dfe2ee]">“{latest.corrected}”</span>
+                </div>
+                {(latest.explanation || latest.explanation_native) && (
+                  <div className="flex items-start gap-1.5 text-[#bdc8d1] bg-[#141820]/70 rounded-xl px-2 py-1 mt-0.5 border border-[#3e484f]/20">
+                    <span className="font-semibold text-[#ffc176] min-w-[40px]">Why:</span>
+                    <div className="flex flex-col">
+                      {latest.explanation && <span>{latest.explanation}</span>}
+                      {latest.explanation_native && (
+                        <span className="text-[#8ed5ff] text-[11px] mt-0.5 font-medium">
+                          {latest.explanation_native}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })()}
 
         {/* BOTTOM 40–45%: Clean Live Transcription Stream with Auto-scroll */}
         <section className="flex-[2] min-h-[140px] max-h-[220px] w-full bg-[#181c24]/90 border border-[#3e484f]/25 backdrop-blur-xl rounded-2xl p-4 shadow-md flex flex-col gap-2 relative overflow-hidden">

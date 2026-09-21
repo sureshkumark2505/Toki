@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect, text, event
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from .config import settings
 
@@ -7,8 +7,19 @@ is_sqlite = settings.database_url.startswith("sqlite")
 if is_sqlite:
     engine = create_engine(
         settings.database_url,
-        connect_args={"check_same_thread": False}
+        connect_args={"check_same_thread": False, "timeout": 15}
     )
+
+    @event.listens_for(engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=5000")
+        except Exception:
+            pass
+        finally:
+            cursor.close()
 else:
     engine = create_engine(
         settings.database_url,
@@ -34,7 +45,7 @@ def init_db():
                 user_cols = {c["name"] for c in inspector.get_columns("users")}
                 user_cols_to_add = [
                     ("xp", "INTEGER DEFAULT 100"),
-                    ("streak_days", "INTEGER DEFAULT 1"),
+                    ("streak_days", "INTEGER DEFAULT 0"),
                     ("last_practice_date", "VARCHAR(10) DEFAULT ''"),
                     ("badges", "TEXT DEFAULT '[]'"),
                 ]

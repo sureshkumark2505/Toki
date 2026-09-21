@@ -9,6 +9,13 @@ import { VoiceState } from '../../types';
 import { PCMAudioRecorder } from './pcmAudioRecorder';
 import { PCMAudioPlayer } from './pcmAudioPlayer';
 
+export interface LiveCorrection {
+  original: string;
+  corrected: string;
+  explanation: string;
+  explanation_native?: string;
+}
+
 export interface GeminiLiveCallbacks {
   onTokiTranscript?: (chunk: string) => void;
   onUserTranscript?: (text: string, isInterim?: boolean) => void;
@@ -19,6 +26,7 @@ export interface GeminiLiveCallbacks {
   onError?: (error: string) => void;
   onConnected?: (info: { model: string; voice: string }) => void;
   onClosed?: () => void;
+  onCorrection?: (correction: LiveCorrection) => void;
 }
 
 export class GeminiLiveClient {
@@ -111,6 +119,13 @@ export class GeminiLiveClient {
               if (!this.player.getIsPlaying() && !this.isMuted) {
                 this.setState('listening');
               }
+            } else if (msg.type === 'correction') {
+              this.callbacks.onCorrection?.({
+                original: msg.original || '',
+                corrected: msg.corrected || '',
+                explanation: msg.explanation || '',
+                explanation_native: msg.explanation_native || '',
+              });
             } else if (msg.type === 'error') {
               this.callbacks.onError?.(msg.message || 'Gemini Live error');
             }

@@ -15,6 +15,6 @@ services:
       - key: DATABASE_URL
         sync: false
       - key: CORS_ORIGINS
-        value: "*"
+        value: https://tokii2026.vercel.app
       - key: APP_ENV
         value: production

@@ -5,13 +5,28 @@ from typing import AsyncGenerator, Dict, Any, Optional
 from google import genai
 from google.genai import types
 from ..config import settings
+from ..coaching import build_live_system_prompt
 
 logger = logging.getLogger("gemini_live")
 
 class GeminiLiveBridge:
-    def __init__(self, objective: str = "English conversation practice", voice_name: str = "Puck"):
+    def __init__(
+        self,
+        objective: str = "English conversation practice",
+        voice_name: str = "Puck",
+        level: str = "Developing",
+        native_language: str = "Tamil",
+        explanation_language: str = "Tamil",
+        correction_style: str = "Balanced",
+        recurring_mistakes: list[str] | None = None,
+    ):
         self.objective = objective
         self.voice_name = voice_name
+        self.level = level
+        self.native_language = native_language
+        self.explanation_language = explanation_language
+        self.correction_style = correction_style
+        self.recurring_mistakes = recurring_mistakes or []
         self.client = genai.Client(api_key=settings.gemini_api_key) if settings.gemini_api_key else None
         self.session: Optional[genai.live.AsyncSession] = None
         self._ctx = None
@@ -20,15 +35,13 @@ class GeminiLiveBridge:
         if not self.client:
             raise ValueError("GEMINI_API_KEY is not configured in backend.")
 
-        system_prompt = (
-            f"You are Toki, a friendly, encouraging, and natural voice-first English speaking coach. "
-            f"Current practice topic/objective: '{self.objective}'. "
-            f"Guidelines for spoken dialogue: "
-            f"1. Respond directly and naturally as in a real spoken conversation. "
-            f"2. Keep each spoken response concise (usually 1 to 2 sentences) so the learner has ample space to speak. "
-            f"3. Ask warm follow-up questions to keep the conversation flowing smoothly. "
-            f"4. Speak clearly with natural English cadence and intonation. "
-            f"5. Start by greeting the learner warmly and inviting them to speak about '{self.objective}'."
+        system_prompt = build_live_system_prompt(
+            objective=self.objective,
+            level=self.level,
+            native_language=self.native_language,
+            explanation_language=self.explanation_language,
+            correction_style=self.correction_style,
+            recurring_mistakes=self.recurring_mistakes,
         )
 
         model_name = settings.gemini_live_model or "gemini-2.5-flash-native-audio-latest"

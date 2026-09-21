@@ -142,6 +142,17 @@ class ProgressReportAIResult(BaseModel):
     baseline_vs_current: dict[str, int]
     recommended_next_goals: list[str]
 
+class UtteranceMistake(BaseModel):
+    original: str
+    corrected: str
+    category: str = "grammar"
+    explanation: str = ""
+    explanation_native: str = ""
+
+class UtteranceAnalysis(BaseModel):
+    is_practice: bool = True
+    mistakes: list[UtteranceMistake] = []
+
 class AIProvider(ABC):
     @abstractmethod
     def coach(self, objective: str, transcript: str, history: list[str]) -> CoachResult: ...
@@ -171,6 +182,15 @@ class AIProvider(ABC):
     def evaluate_dictation(self, original_text: str, learner_text: str) -> DictationEvaluationAIResult: ...
     @abstractmethod
     def generate_progress_report(self, user_name: str, level: str, sessions_count: int, speaking_minutes: int, current_scores: dict, baseline_scores: dict, mistakes: list[str]) -> ProgressReportAIResult: ...
+
+    def analyze_utterance(
+        self,
+        transcript: str,
+        level: str = "Intermediate",
+        explanation_language: str = "Tamil",
+        recent_context: list[str] | None = None
+    ) -> UtteranceAnalysis:
+        return UtteranceAnalysis(is_practice=True, mistakes=[])
 
 
 class GeminiProvider(AIProvider):
@@ -776,5 +796,47 @@ Return JSON with:
                 recommended_next_goals=["Target 20 speaking minutes daily.", "Practice extempore drills with 2-minute limits.", "Master 5 new vocabulary phrases in context."]
             )
 
+    def analyze_utterance(
+        self,
+        transcript: str,
+        level: str = "Intermediate",
+        explanation_language: str = "Tamil",
+        recent_context: list[str] | None = None
+    ) -> UtteranceAnalysis:
+        if not self.client or not transcript or not transcript.strip():
+            return UtteranceAnalysis(is_practice=True, mistakes=[])
+
+        prompt = f'''Analyze this single spoken utterance from an English learner.
+Learner level: {level}
+Learner native / explanation language: {explanation_language}
+Recent conversation context: {recent_context[-4:] if recent_context else []}
+Learner utterance: "{transcript}"
+
+RULES:
+1. Input is speech-to-text: completely IGNORE punctuation, capitalisation, casing, and speech fillers (um, uh, like, you know).
+2. Do NOT flag natural informal or conversational speech as an error.
+3. NEVER invent or fabricate errors. If the utterance is grammatically sound and natural, return mistakes: [].
+4. Greetings, farewells, short acknowledgments, or one-word answers MUST return mistakes: [].
+5. If there is a clear grammatical or phrasing mistake (tense, subject-verb agreement, preposition, article, unnatural word order), identify up to 2 most important mistakes.
+6. Provide concise explanation in English and explanation_native in {explanation_language} (e.g. Tamil).
+7. Return JSON adhering to schema with is_practice: bool and mistakes: list.'''
+        try:
+            response = self.client.models.generate_content(
+                model=settings.gemini_model,
+                contents=prompt,
+                config={"response_mime_type": "application/json", "response_schema": UtteranceAnalysis}
+            )
+            res = UtteranceAnalysis.model_validate_json(response.text)
+            valid_mistakes = [
+                m for m in res.mistakes
+                if m.original.strip().lower() != m.corrected.strip().lower()
+                and m.corrected.strip()
+            ]
+            return UtteranceAnalysis(is_practice=res.is_practice, mistakes=valid_mistakes[:2])
+        except Exception as e:
+            logger.warning(f"Gemini analyze_utterance failed or quota reached ({e}). Returning empty analysis.")
+            return UtteranceAnalysis(is_practice=True, mistakes=[])
+
 provider = GeminiProvider()
+
 

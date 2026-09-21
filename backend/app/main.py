@@ -27,6 +27,13 @@ from .schemas import (
 )
 from .providers.ai import provider
 from .providers.live import GeminiLiveBridge
+from .coaching import (
+    is_meaningful_turn,
+    evaluate_session,
+    next_streak,
+    today_local,
+    LiveTurnAssembler,
+)
 
 logger = logging.getLogger("api_main")
 
@@ -352,12 +359,74 @@ def turn(session_id: int, payload: CoachTurn, d: DbSession = Depends(db)):
     d.commit()
     return result
 
+# Helper to qualify and award streak & XP across guided, scenario, and interview sessions
+def award_session_streak_and_xp(
+    user: User,
+    session: Session,
+    learner_turns: list[str],
+    d: DbSession,
+    already_ended: bool
+) -> tuple[bool, int, int, str]:
+    """
+    Evaluates learner turns against qualification criteria (>=4 meaningful turns & >=40 words).
+    If qualified and session wasn't already ended, awards streak, XP, and updates ProgressSnapshot.
+    Returns: (streak_counted: bool, streak_days: int, xp_earned: int, practice_message: str)
+    """
+    eval_res = evaluate_session(learner_turns)
+    if not eval_res.qualifies:
+        return False, user.streak_days or 0, 0, eval_res.practice_message
+
+    if already_ended:
+        return True, user.streak_days or 0, 0, ""
+
+    duration_minutes = 1
+    if session.started_at and session.ended_at:
+        delta = (session.ended_at - session.started_at).total_seconds()
+        duration_minutes = max(1, round(delta / 60))
+    elif len(learner_turns) > 0:
+        duration_minutes = max(1, round(len(learner_turns) * 0.75))
+
+    xp_earned = min(50, 10 + 2 * eval_res.meaningful_turns)
+
+    today = today_local()
+    today_str = today.isoformat()
+    user.streak_days = next_streak(user.streak_days or 0, user.last_practice_date, today)
+    user.last_practice_date = today_str
+    user.xp = (user.xp or 0) + xp_earned
+
+    # Update or insert today's ProgressSnapshot
+    snap = d.query(ProgressSnapshot).filter_by(user_id=user.id, date=today_str).first()
+    if not snap:
+        profile = d.query(LearningProfile).filter_by(user_id=user.id).first()
+        base = profile.baseline_scores if profile and profile.baseline_scores else {
+            "fluency": 75, "grammar": 75, "vocabulary": 75, "clarity": 75, "listening": 75, "confidence": 75
+        }
+        snap = ProgressSnapshot(
+            user_id=user.id,
+            date=today_str,
+            fluency=base.get("fluency", 75),
+            grammar=base.get("grammar", 75),
+            vocab=base.get("vocabulary", 75),
+            clarity=base.get("clarity", 75),
+            listening=base.get("listening", 75),
+            confidence=base.get("confidence", 75),
+            overall_score=sum(base.values()) // max(1, len(base)),
+            speaking_minutes=duration_minutes
+        )
+        d.add(snap)
+    else:
+        snap.speaking_minutes = (snap.speaking_minutes or 0) + duration_minutes
+
+    d.commit()
+    return True, user.streak_days or 0, xp_earned, ""
+
 # ----------------- GEMINI LIVE REAL-TIME AUDIO WEBSOCKET -----------------
 @app.websocket("/api/ws/live/{session_id}")
 async def websocket_live_session(websocket: WebSocket, session_id: int):
     await websocket.accept()
     d = SessionLocal()
     bridge: GeminiLiveBridge | None = None
+    analysis_tasks: set[asyncio.Task] = set()
     try:
         session = d.get(Session, session_id)
         if not session or session.ended_at:
@@ -365,7 +434,16 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
             await websocket.close()
             return
 
+        user = d.get(User, session.user_id)
+        native_language = user.native_language if user and user.native_language else "Tamil"
+
+        profile = d.query(LearningProfile).filter_by(user_id=session.user_id).first()
+        level = profile.level if profile and profile.level else "Developing"
+
         user_settings = d.query(UserSettings).filter_by(user_id=session.user_id).first()
+        explanation_language = user_settings.explanation_language if user_settings and user_settings.explanation_language else "Tamil"
+        correction_style = user_settings.correction_style if user_settings and user_settings.correction_style else "Balanced & Encouraging"
+
         voice_name = "Puck"
         voice_val = getattr(user_settings, 'coach_voice', '') or getattr(user_settings, 'voice_accent', '')
         if voice_val:
@@ -377,7 +455,20 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
             elif "us" in accent or "american" in accent:
                 voice_name = "Puck"
 
-        bridge = GeminiLiveBridge(objective=session.objective, voice_name=voice_name)
+        # Top 3 recurring mistakes by frequency
+        top_mistakes_rows = d.query(Mistake).filter_by(user_id=session.user_id).order_by(Mistake.frequency.desc()).limit(3).all()
+        top_mistakes = [m.correction for m in top_mistakes_rows if m.correction]
+
+        bridge = GeminiLiveBridge(
+            objective=session.objective,
+            voice_name=voice_name,
+            level=level,
+            native_language=native_language,
+            explanation_language=explanation_language,
+            correction_style=correction_style,
+            recurring_mistakes=top_mistakes,
+        )
+
         try:
             await bridge.connect()
         except Exception as e:
@@ -408,11 +499,71 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
             logger.info("Client disconnected before 'connected' was sent. session_id=%s", session_id)
             return
 
-        current_toki_transcript: list[str] = []
-        last_persisted_user_turn: str = ""
+        assembler = LiveTurnAssembler()
+        gemini_input_seen = False
+        user_id = session.user_id
+
+        async def run_turn_analysis(text: str):
+            if not is_meaningful_turn(text):
+                return
+            try:
+                analysis = await asyncio.to_thread(
+                    provider.analyze_utterance,
+                    text,
+                    level,
+                    explanation_language
+                )
+                if not analysis or not analysis.mistakes:
+                    return
+
+                with SessionLocal() as db_task:
+                    for m in analysis.mistakes:
+                        corr = m.corrected.strip()
+                        if not corr:
+                            continue
+                        existing = db_task.query(Mistake).filter(
+                            Mistake.user_id == user_id,
+                            Mistake.correction.ilike(corr)
+                        ).first()
+                        if existing:
+                            existing.frequency += 1
+                            existing.last_seen = datetime.utcnow()
+                            existing.next_review = datetime.utcnow() + timedelta(days=1)
+                            if m.explanation:
+                                existing.explanation = m.explanation
+                        else:
+                            db_task.add(Mistake(
+                                user_id=user_id,
+                                category=m.category or "grammar",
+                                pattern=m.category or "general",
+                                original=m.original,
+                                correction=m.corrected,
+                                explanation=m.explanation or "",
+                                frequency=1,
+                                mastery=0,
+                                interval_days=1,
+                                last_seen=datetime.utcnow(),
+                                next_review=datetime.utcnow() + timedelta(days=1)
+                            ))
+                    db_task.commit()
+
+                # Send live correction to client
+                for m in analysis.mistakes:
+                    try:
+                        await websocket.send_json({
+                            "type": "correction",
+                            "original": m.original,
+                            "corrected": m.corrected,
+                            "explanation": m.explanation,
+                            "explanation_native": m.explanation_native
+                        })
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning(f"Background turn analysis skipped or failed ({e})")
 
         async def receive_from_client():
-            nonlocal last_persisted_user_turn
+            nonlocal gemini_input_seen
             try:
                 while True:
                     data = await websocket.receive_text()
@@ -420,28 +571,35 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
                     msg_type = msg.get("type")
 
                     if msg_type == "audio":
-                        # Base64 PCM 16kHz 16-bit Mono
                         b64_data = msg.get("data", "")
                         if b64_data:
                             pcm_bytes = base64.b64decode(b64_data)
                             await bridge.send_audio_chunk(pcm_bytes)
 
                     elif msg_type == "text":
-                        # Quiet mode text prompt
                         text = msg.get("text", "").strip()
                         if text:
-                            d.add(Turn(session_id=session_id, speaker="learner", transcript=text))
-                            d.commit()
-                            last_persisted_user_turn = text
+                            with SessionLocal() as db_turn:
+                                db_turn.add(Turn(session_id=session_id, speaker="learner", transcript=text))
+                                db_turn.commit()
+                            if is_meaningful_turn(text):
+                                t = asyncio.create_task(run_turn_analysis(text))
+                                analysis_tasks.add(t)
+                                t.add_done_callback(analysis_tasks.discard)
                             await bridge.send_text(text)
 
                     elif msg_type == "user_transcript":
-                        # Fallback STT from client (only persisted if not already captured by Gemini Live)
-                        text = msg.get("text", "").strip()
-                        if text and text != last_persisted_user_turn:
-                            d.add(Turn(session_id=session_id, speaker="learner", transcript=text))
-                            d.commit()
-                            last_persisted_user_turn = text
+                        # Only accept fallback if Gemini Live input transcription was not seen in this session
+                        if not gemini_input_seen:
+                            text = msg.get("text", "").strip()
+                            if text:
+                                with SessionLocal() as db_turn:
+                                    db_turn.add(Turn(session_id=session_id, speaker="learner", transcript=text))
+                                    db_turn.commit()
+                                if is_meaningful_turn(text):
+                                    t = asyncio.create_task(run_turn_analysis(text))
+                                    analysis_tasks.add(t)
+                                    t.add_done_callback(analysis_tasks.discard)
 
                     elif msg_type == "end_session":
                         break
@@ -451,7 +609,7 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
                 logger.exception("receive_from_client failed")
 
         async def send_to_client():
-            nonlocal last_persisted_user_turn
+            nonlocal gemini_input_seen
             try:
                 async for event in bridge.receive_events():
                     event_type = event.get("type")
@@ -459,26 +617,71 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
                     if event_type == "transcript":
                         speaker = event.get("speaker")
                         if speaker == "toki":
-                            current_toki_transcript.append(event.get("text", ""))
-                        elif speaker == "user" and event.get("finished", True) and not event.get("is_interim", False):
-                            # Authoritative user turn from Gemini Live input transcription
-                            user_text = event.get("text", "").strip()
-                            if user_text and user_text != last_persisted_user_turn:
-                                d.add(Turn(session_id=session_id, speaker="learner", transcript=user_text))
-                                d.commit()
-                                last_persisted_user_turn = user_text
+                            toki_chunk = event.get("text", "")
+                            # Coach chunk arriving finalizes any pending user turn
+                            finalized_user = assembler.push_coach_chunk(toki_chunk)
+                            if finalized_user:
+                                try:
+                                    await websocket.send_json({
+                                        "type": "transcript",
+                                        "speaker": "user",
+                                        "text": finalized_user,
+                                        "is_interim": False,
+                                    })
+                                except Exception:
+                                    pass
+                                with SessionLocal() as db_turn:
+                                    db_turn.add(Turn(session_id=session_id, speaker="learner", transcript=finalized_user))
+                                    db_turn.commit()
+                                if is_meaningful_turn(finalized_user):
+                                    t = asyncio.create_task(run_turn_analysis(finalized_user))
+                                    analysis_tasks.add(t)
+                                    t.add_done_callback(analysis_tasks.discard)
+
+                        elif speaker == "user":
+                            gemini_input_seen = True
+                            user_chunk = event.get("text", "")
+                            is_interim = event.get("is_interim", False)
+                            accumulated = assembler.push_user_chunk(user_chunk, is_interim=is_interim)
+                            try:
+                                await websocket.send_json({
+                                    "type": "transcript",
+                                    "speaker": "user",
+                                    "text": accumulated,
+                                    "is_interim": True,
+                                })
+                            except Exception:
+                                pass
+                            continue
 
                     elif event_type == "interrupted":
-                        # Barge-in: invalidate interrupted pending coach turn
-                        current_toki_transcript.clear()
+                        assembler.handle_interruption()
 
                     elif event_type == "turn_complete":
-                        # Turn finalized: assemble incremental chunks into a single coach turn
-                        full_text = "".join(current_toki_transcript).strip()
-                        if full_text:
-                            d.add(Turn(session_id=session_id, speaker="coach", transcript=full_text))
-                            d.commit()
-                            current_toki_transcript.clear()
+                        finalized_user = assembler.finalize_user_turn()
+                        if finalized_user:
+                            try:
+                                await websocket.send_json({
+                                    "type": "transcript",
+                                    "speaker": "user",
+                                    "text": finalized_user,
+                                    "is_interim": False,
+                                })
+                            except Exception:
+                                pass
+                            with SessionLocal() as db_turn:
+                                db_turn.add(Turn(session_id=session_id, speaker="learner", transcript=finalized_user))
+                                db_turn.commit()
+                            if is_meaningful_turn(finalized_user):
+                                t = asyncio.create_task(run_turn_analysis(finalized_user))
+                                analysis_tasks.add(t)
+                                t.add_done_callback(analysis_tasks.discard)
+
+                        finalized_coach = assembler.finalize_coach_turn()
+                        if finalized_coach:
+                            with SessionLocal() as db_turn:
+                                db_turn.add(Turn(session_id=session_id, speaker="coach", transcript=finalized_coach))
+                                db_turn.commit()
 
                     try:
                         await websocket.send_json(event)
@@ -506,11 +709,23 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
             p.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
 
+        final_user = assembler.finalize_user_turn()
+        if final_user:
+            with SessionLocal() as db_turn:
+                db_turn.add(Turn(session_id=session_id, speaker="learner", transcript=final_user))
+                db_turn.commit()
+            if is_meaningful_turn(final_user):
+                await run_turn_analysis(final_user)
+
     except (WebSocketDisconnect, RuntimeError):
         pass
     except Exception as e:
         logger.warning(f"WebSocket session error: {e}")
     finally:
+        for task in list(analysis_tasks):
+            task.cancel()
+        if analysis_tasks:
+            await asyncio.gather(*analysis_tasks, return_exceptions=True)
         if bridge:
             await bridge.close()
         d.close()
@@ -522,64 +737,114 @@ def end_session(session_id: int, d: DbSession = Depends(db)):
     session = d.get(Session, session_id)
     if not session:
         raise HTTPException(404, "Session not found")
-    session.ended_at = datetime.utcnow()
-    d.commit()
+    
+    already_ended = session.ended_at is not None
+    if not already_ended:
+        session.ended_at = datetime.utcnow()
+        d.commit()
 
     turns = d.query(Turn).filter_by(session_id=session_id).order_by(Turn.created_at).all()
     turn_dicts = [{"speaker": t.speaker, "transcript": t.transcript} for t in turns]
-    mistakes = d.query(Mistake).filter_by(user_id=session.user_id).order_by(Mistake.id.desc()).limit(5).all()
-    mistake_dicts = [{"original": m.original, "correction": m.correction, "explanation": m.explanation} for m in mistakes]
+    learner_turns = [t.transcript for t in turns if t.speaker == "learner" and t.transcript.strip()]
 
-    total_words = sum(len(t.transcript.split()) for t in turns if t.transcript)
-    user_turns = [t for t in turns if t.speaker == "learner" and t.transcript.strip()]
+    user = d.get(User, session.user_id)
+    streak_counted, streak_days, xp_earned, practice_msg = award_session_streak_and_xp(
+        user=user,
+        session=session,
+        learner_turns=learner_turns,
+        d=d,
+        already_ended=already_ended
+    )
 
-    # If the transcript is empty or insufficient, DO NOT fabricate scores or feedback
-    if not user_turns or total_words < 6:
-        report_summary = "Your conversation was saved, but there wasn't enough transcript data to generate detailed feedback."
-        scores_dict = {"fluency": 70, "grammar": 70, "vocabulary": 70, "clarity": 70, "confidence": 70}
-        corrections_list = []
-        vocab_list = []
-        rec_exercise = "Try speaking for at least 1-2 minutes in your next session to receive detailed feedback."
-        strengths_list = ["Session started and saved successfully"]
-    else:
-        report = provider.generate_session_report(session.objective, turn_dicts, mistake_dicts)
-        scores_dict = report.scores.model_dump()
-        corrections_list = [c.model_dump() for c in report.key_corrections]
-        vocab_list = [v.model_dump() for v in report.vocabulary_captured]
-        report_summary = report.summary
-        rec_exercise = report.recommended_exercise
-        strengths_list = report.strengths
+    if not streak_counted:
+        return SessionReportResponse(
+            session_id=session_id,
+            summary="Your conversation was saved, but there wasn't enough speech data to generate detailed diagnostic feedback.",
+            turn_count=len(turns),
+            scores={},
+            strengths=[],
+            key_corrections=[],
+            vocabulary_captured=[],
+            recommended_exercise="Speak for at least 4 complete sentences in your next session to receive detailed feedback and streak progress.",
+            streak_counted=False,
+            streak_days=streak_days,
+            xp_earned=0,
+            practice_message=practice_msg
+        )
+
+    # Qualifying session: Generate diagnostic report
+    session_mistakes = d.query(Mistake).filter(
+        Mistake.user_id == session.user_id,
+        Mistake.last_seen >= session.started_at
+    ).all()
+    if not session_mistakes:
+        session_mistakes = d.query(Mistake).filter_by(user_id=session.user_id).order_by(Mistake.id.desc()).limit(3).all()
+    mistake_dicts = [{"original": m.original, "correction": m.correction, "explanation": m.explanation} for m in session_mistakes]
+
+    report = provider.generate_session_report(session.objective, turn_dicts, mistake_dicts)
+    scores_dict = report.scores.model_dump()
+    corrections_list = [c.model_dump() for c in report.key_corrections]
+    vocab_list = [v.model_dump() for v in report.vocabulary_captured]
 
     feedback = d.query(SessionFeedback).filter_by(session_id=session_id).first()
     if not feedback:
         feedback = SessionFeedback(
             session_id=session_id,
             user_id=session.user_id,
-            summary=report_summary,
-            fluency_score=scores_dict.get("fluency", 70),
-            grammar_score=scores_dict.get("grammar", 70),
-            vocab_score=scores_dict.get("vocabulary", 70),
-            clarity_score=scores_dict.get("clarity", 70),
-            confidence_score=scores_dict.get("confidence", 70),
-            strengths=strengths_list,
+            summary=report.summary,
+            fluency_score=scores_dict.get("fluency", 75),
+            grammar_score=scores_dict.get("grammar", 75),
+            vocab_score=scores_dict.get("vocabulary", 75),
+            clarity_score=scores_dict.get("clarity", 75),
+            confidence_score=scores_dict.get("confidence", 75),
+            strengths=report.strengths,
             key_corrections=corrections_list,
             vocabulary_captured=vocab_list,
-            recommended_exercise=rec_exercise
+            recommended_exercise=report.recommended_exercise
         )
         d.add(feedback)
     else:
-        feedback.summary = report_summary
-        feedback.fluency_score = scores_dict.get("fluency", 70)
-        feedback.grammar_score = scores_dict.get("grammar", 70)
-        feedback.vocab_score = scores_dict.get("vocabulary", 70)
-        feedback.clarity_score = scores_dict.get("clarity", 70)
-        feedback.confidence_score = scores_dict.get("confidence", 70)
-        feedback.strengths = strengths_list
+        feedback.summary = report.summary
+        feedback.fluency_score = scores_dict.get("fluency", 75)
+        feedback.grammar_score = scores_dict.get("grammar", 75)
+        feedback.vocab_score = scores_dict.get("vocabulary", 75)
+        feedback.clarity_score = scores_dict.get("clarity", 75)
+        feedback.confidence_score = scores_dict.get("confidence", 75)
+        feedback.strengths = report.strengths
         feedback.key_corrections = corrections_list
         feedback.vocabulary_captured = vocab_list
-        feedback.recommended_exercise = rec_exercise
+        feedback.recommended_exercise = report.recommended_exercise
 
-    # Auto-save captured vocabulary to vocabulary table if not already added
+    # If live analysis did not log mistakes, upsert the report's key corrections into Mistake
+    if not session_mistakes:
+        for c in report.key_corrections:
+            corr_text = c.correction.strip()
+            if not corr_text:
+                continue
+            existing = d.query(Mistake).filter(
+                Mistake.user_id == session.user_id,
+                Mistake.correction.ilike(corr_text)
+            ).first()
+            if existing:
+                existing.frequency += 1
+                existing.last_seen = datetime.utcnow()
+                existing.next_review = datetime.utcnow() + timedelta(days=1)
+            else:
+                d.add(Mistake(
+                    user_id=session.user_id,
+                    category="grammar",
+                    pattern="general",
+                    original=c.original,
+                    correction=c.correction,
+                    explanation=c.explanation,
+                    frequency=1,
+                    mastery=0,
+                    interval_days=1,
+                    last_seen=datetime.utcnow(),
+                    next_review=datetime.utcnow() + timedelta(days=1)
+                ))
+
+    # Auto-save captured vocabulary
     for vocab in vocab_list:
         word = vocab.get("word")
         if word and not d.query(Vocabulary).filter_by(user_id=session.user_id, word_or_phrase=word).first():
@@ -596,13 +861,17 @@ def end_session(session_id: int, d: DbSession = Depends(db)):
 
     return SessionReportResponse(
         session_id=session_id,
-        summary=report_summary,
+        summary=report.summary,
         turn_count=len(turns),
         scores=scores_dict,
-        strengths=strengths_list,
+        strengths=report.strengths,
         key_corrections=corrections_list,
         vocabulary_captured=vocab_list,
-        recommended_exercise=rec_exercise
+        recommended_exercise=report.recommended_exercise,
+        streak_counted=True,
+        streak_days=streak_days,
+        xp_earned=xp_earned,
+        practice_message=""
     )
 
 @app.get("/api/sessions/history/{user_id}", response_model=list[SessionHistoryItem])
@@ -878,11 +1147,25 @@ def end_scenario(session_id: int, d: DbSession = Depends(db)):
     session = d.get(Session, session_id)
     if not session:
         raise HTTPException(404, "Session not found")
-    session.ended_at = datetime.utcnow()
-    d.commit()
+    
+    already_ended = session.ended_at is not None
+    if not already_ended:
+        session.ended_at = datetime.utcnow()
+        d.commit()
 
     turns = d.query(Turn).filter_by(session_id=session_id).order_by(Turn.created_at).all()
     turn_dicts = [{"speaker": t.speaker, "transcript": t.transcript} for t in turns]
+    learner_turns = [t.transcript for t in turns if t.speaker == "learner" and t.transcript.strip()]
+
+    user = d.get(User, session.user_id)
+    award_session_streak_and_xp(
+        user=user,
+        session=session,
+        learner_turns=learner_turns,
+        d=d,
+        already_ended=already_ended
+    )
+
     role_name = session.objective.split("—")[-1].replace("Roleplay with", "").strip() if "—" in session.objective else "Partner"
 
     report = provider.generate_scenario_report(
@@ -892,21 +1175,23 @@ def end_scenario(session_id: int, d: DbSession = Depends(db)):
     )
 
     scores_dict = report.scores.model_dump()
-    feedback = SessionFeedback(
-        session_id=session_id,
-        user_id=session.user_id,
-        summary=report.summary,
-        fluency_score=scores_dict.get("fluency", 80),
-        grammar_score=scores_dict.get("grammar", 80),
-        vocab_score=scores_dict.get("vocabulary", 80),
-        clarity_score=scores_dict.get("clarity", 80),
-        confidence_score=scores_dict.get("confidence", 80),
-        strengths=report.strengths,
-        key_corrections=[],
-        vocabulary_captured=[],
-        recommended_exercise="Practice repeating this scenario focusing on diplomatic phrases."
-    )
-    d.add(feedback)
+    feedback = d.query(SessionFeedback).filter_by(session_id=session_id).first()
+    if not feedback:
+        feedback = SessionFeedback(
+            session_id=session_id,
+            user_id=session.user_id,
+            summary=report.summary,
+            fluency_score=scores_dict.get("fluency", 80),
+            grammar_score=scores_dict.get("grammar", 80),
+            vocab_score=scores_dict.get("vocabulary", 80),
+            clarity_score=scores_dict.get("clarity", 80),
+            confidence_score=scores_dict.get("confidence", 80),
+            strengths=report.strengths,
+            key_corrections=[],
+            vocabulary_captured=[],
+            recommended_exercise="Practice repeating this scenario focusing on diplomatic phrases."
+        )
+        d.add(feedback)
     d.commit()
 
     return ScenarioReportResponse(
@@ -968,11 +1253,24 @@ def end_interview(session_id: int, target_role: str = "Software Professional", d
     session = d.get(Session, session_id)
     if not session:
         raise HTTPException(404, "Session not found")
-    session.ended_at = datetime.utcnow()
-    d.commit()
+    
+    already_ended = session.ended_at is not None
+    if not already_ended:
+        session.ended_at = datetime.utcnow()
+        d.commit()
 
     turns = d.query(Turn).filter_by(session_id=session_id).order_by(Turn.created_at).all()
     turn_dicts = [{"speaker": t.speaker, "transcript": t.transcript} for t in turns]
+    learner_turns = [t.transcript for t in turns if t.speaker == "learner" and t.transcript.strip()]
+
+    user = d.get(User, session.user_id)
+    award_session_streak_and_xp(
+        user=user,
+        session=session,
+        learner_turns=learner_turns,
+        d=d,
+        already_ended=already_ended
+    )
 
     # Extract interview type and attempt number
     interview_type = "HR Round: Introduction & Fit"
@@ -1182,20 +1480,11 @@ AVAILABLE_BADGES = [
 ]
 
 def record_activity_and_award_xp(user: User, xp_gain: int, practice_minutes: int, d: DbSession):
-    user.xp = (user.xp or 100) + xp_gain
-    today_str = date.today().isoformat()
+    user.xp = (user.xp or 0) + xp_gain
+    today = today_local()
+    today_str = today.isoformat()
     if user.last_practice_date != today_str:
-        if user.last_practice_date:
-            try:
-                last_dt = date.fromisoformat(user.last_practice_date)
-                if (date.today() - last_dt).days == 1:
-                    user.streak_days = (user.streak_days or 1) + 1
-                elif (date.today() - last_dt).days > 1:
-                    user.streak_days = 1
-            except Exception:
-                user.streak_days = 1
-        else:
-            user.streak_days = 1
+        user.streak_days = next_streak(user.streak_days or 0, user.last_practice_date, today)
         user.last_practice_date = today_str
 
     # Update or insert today's ProgressSnapshot
@@ -1596,7 +1885,7 @@ def export_user_data(user_id: int, d: DbSession = Depends(db)):
             "goal": user.goal,
             "daily_minutes": user.daily_minutes,
             "xp": user.xp or 100,
-            "streak_days": user.streak_days or 1,
+            "streak_days": user.streak_days or 0,
             "created_at": user.created_at.isoformat() if user.created_at else None
         },
         settings={
@@ -1664,7 +1953,7 @@ def reset_user_learning_data(user_id: int, d: DbSession = Depends(db)):
 
     # Reset user XP & streak
     user.xp = 100
-    user.streak_days = 1
+    user.streak_days = 0
     user.last_practice_date = ""
 
     d.commit()

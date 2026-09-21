@@ -11,7 +11,7 @@ class User(Base):
     goal: Mapped[str] = mapped_column(String(80), default="Communication")
     daily_minutes: Mapped[int] = mapped_column(Integer, default=20)
     xp: Mapped[int] = mapped_column(Integer, default=100)
-    streak_days: Mapped[int] = mapped_column(Integer, default=1)
+    streak_days: Mapped[int] = mapped_column(Integer, default=0)
     last_practice_date: Mapped[str] = mapped_column(String(10), default="")
     badges: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
