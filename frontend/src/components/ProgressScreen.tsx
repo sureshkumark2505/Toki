@@ -13,6 +13,12 @@ export const ProgressScreen: React.FC<ProgressScreenProps> = ({ userId = 1 }) =>
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [weekDays, setWeekDays] = useState<WeeklyDayActivity[]>([]);
 
+  // --- Feature: Session Transcript Replay ---
+  const [recentSessions, setRecentSessions] = useState<any[]>([]);
+  const [selectedTranscript, setSelectedTranscript] = useState<any | null>(null);
+  const [loadingTranscript, setLoadingTranscript] = useState(false);
+  const [activeTab, setActiveTab] = useState<'progress' | 'transcripts'>('progress');
+
   useEffect(() => {
     let mounted = true;
     async function loadData() {
@@ -22,6 +28,9 @@ export const ProgressScreen: React.FC<ProgressScreenProps> = ({ userId = 1 }) =>
           tokiApi.getProgress(userId),
           tokiApi.getWeeklyTrend(userId),
         ]);
+
+        const sessionsRes = await tokiApi.getSessionHistory(userId, 8).catch(() => []);
+        if (mounted) setRecentSessions(sessionsRes || []);
 
         if (mounted && vocabItems.status === 'fulfilled' && vocabItems.value) {
           const mapped: SavedPhrase[] = vocabItems.value.map((v: BackendVocabItem) => ({
@@ -87,6 +96,19 @@ export const ProgressScreen: React.FC<ProgressScreenProps> = ({ userId = 1 }) =>
     };
   }, [userId]);
 
+  const handleViewTranscript = async (sessionId: number | string) => {
+    setLoadingTranscript(true);
+    try {
+      const data = await fetch(`${import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'}/api/sessions/${sessionId}/transcript`);
+      const json = await data.json();
+      setSelectedTranscript(json);
+    } catch (e) {
+      console.warn('Could not load transcript', e);
+    } finally {
+      setLoadingTranscript(false);
+    }
+  };
+
   const handlePlayAudio = (phrase: SavedPhrase) => {
     if (playingId === phrase.id) {
       defaultVoiceService.stopAll();
@@ -136,6 +158,34 @@ export const ProgressScreen: React.FC<ProgressScreenProps> = ({ userId = 1 }) =>
           </p>
         </div>
       </div>
+
+      {/* Tab Switcher */}
+      <div className="flex bg-[#181c24] border border-[#3e484f]/25 rounded-2xl p-1 gap-1">
+        <button
+          type="button"
+          onClick={() => setActiveTab('progress')}
+          className={`flex-1 py-2 rounded-xl text-[13px] font-semibold transition-all cursor-pointer ${
+            activeTab === 'progress'
+              ? 'bg-[#8ed5ff] text-[#00354a] shadow-sm'
+              : 'text-[#bdc8d1] hover:text-[#dfe2ee]'
+          }`}
+        >
+          Progress
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab('transcripts')}
+          className={`flex-1 py-2 rounded-xl text-[13px] font-semibold transition-all cursor-pointer ${
+            activeTab === 'transcripts'
+              ? 'bg-[#8ed5ff] text-[#00354a] shadow-sm'
+              : 'text-[#bdc8d1] hover:text-[#dfe2ee]'
+          }`}
+        >
+          Transcripts
+        </button>
+      </div>
+
+      {activeTab === 'progress' && (<>
 
       {/* Weekly Rhythm Section */}
       <section className="flex flex-col bg-[#1c2028] border border-[#3e484f]/25 rounded-2xl p-5 shadow-sm">
@@ -336,6 +386,83 @@ export const ProgressScreen: React.FC<ProgressScreenProps> = ({ userId = 1 }) =>
           </div>
         )}
       </section>
+      </>)}
+
+      {activeTab === 'transcripts' && (
+        <section className="flex flex-col gap-3">
+          {selectedTranscript ? (
+            <div className="flex flex-col gap-3">
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setSelectedTranscript(null)}
+                  className="w-9 h-9 rounded-full bg-[#262a33] flex items-center justify-center text-[#bdc8d1] hover:text-[#dfe2ee] cursor-pointer"
+                >
+                  <span className="material-symbols-outlined text-[18px]">arrow_back</span>
+                </button>
+                <div className="flex flex-col">
+                  <span className="text-[14px] font-semibold text-[#dfe2ee] truncate">{selectedTranscript.objective}</span>
+                  <span className="text-[11px] text-[#87929a]">{selectedTranscript.turns?.length || 0} turns</span>
+                </div>
+              </div>
+              <div className="flex flex-col bg-[#181c24] border border-[#3e484f]/25 rounded-2xl p-4 gap-3 max-h-[60vh] overflow-y-auto scrollbar-none">
+                {(selectedTranscript.turns || []).map((turn: any, idx: number) => (
+                  <div key={idx} className={`flex flex-col gap-0.5 ${turn.speaker === 'learner' ? 'items-end' : 'items-start'}`}>
+                    <span className={`text-[10px] font-semibold uppercase tracking-wide ${turn.speaker === 'learner' ? 'text-[#38bdf8]' : 'text-[#8ed5ff]'}`}>
+                      {turn.speaker === 'learner' ? 'You' : 'Toki'}
+                    </span>
+                    <div className={`max-w-[85%] px-3.5 py-2.5 rounded-2xl text-[13px] leading-relaxed ${
+                      turn.speaker === 'learner'
+                        ? 'bg-[#38bdf8]/15 border border-[#38bdf8]/20 text-[#dfe2ee]'
+                        : 'bg-[#262a33] border border-[#3e484f]/30 text-[#bdc8d1]'
+                    }`}>
+                      {turn.text}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="flex items-center justify-between px-1">
+                <span className="text-[16px] font-semibold text-[#dfe2ee]">Session Transcripts</span>
+                <span className="text-[12px] text-[#87929a]">Tap to replay</span>
+              </div>
+              {recentSessions.length > 0 ? (
+                <div className="flex flex-col gap-2.5">
+                  {recentSessions.map((session: any) => (
+                    <button
+                      key={session.id}
+                      type="button"
+                      onClick={() => handleViewTranscript(session.id)}
+                      className="w-full rounded-2xl bg-[#181c24] border border-[#3e484f]/20 p-4 flex items-center justify-between hover:border-[#8ed5ff]/30 hover:bg-[#1c2028] cursor-pointer active:scale-[0.99] transition-all text-left"
+                    >
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="w-9 h-9 rounded-full bg-[#262a33] flex-shrink-0 flex items-center justify-center text-[#8ed5ff]">
+                          <span className="material-symbols-outlined text-[18px]">chat_bubble</span>
+                        </div>
+                        <div className="flex flex-col min-w-0">
+                          <span className="text-[14px] font-semibold text-[#dfe2ee] truncate">{session.objective}</span>
+                          <span className="text-[12px] text-[#87929a]">{session.turn_count || '?'} turns · {session.duration_minutes || 1} min</span>
+                        </div>
+                      </div>
+                      <span className="material-symbols-outlined text-[18px] text-[#87929a] flex-shrink-0">chevron_right</span>
+                    </button>
+                  ))}
+                </div>
+              ) : loadingTranscript ? (
+                <div className="text-center py-8 text-[#87929a] text-[13px]">Loading sessions...</div>
+              ) : (
+                <div className="w-full rounded-2xl bg-[#181c24] border border-[#3e484f]/20 p-6 flex flex-col items-center text-center gap-2">
+                  <span className="material-symbols-outlined text-[#87929a] text-[32px]">history_edu</span>
+                  <p className="text-[14px] text-[#dfe2ee]">No sessions yet</p>
+                  <p className="text-[12px] text-[#87929a]">Complete a practice session to see your conversation transcripts here.</p>
+                </div>
+              )}
+            </>
+          )}
+        </section>
+      )}
     </div>
   );
 };

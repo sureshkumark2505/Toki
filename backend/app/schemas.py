@@ -147,6 +147,7 @@ class SessionReportResponse(BaseModel):
     streak_days: int = 0
     xp_earned: int = 0
     practice_message: str = ""
+    newly_awarded_badges: list[dict] = []
 
 # ----------------- PHASE 5: SCENARIOS & ROLEPLAY -----------------
 class ScenarioItem(BaseModel):

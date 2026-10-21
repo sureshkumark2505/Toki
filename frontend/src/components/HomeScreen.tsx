@@ -22,6 +22,17 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const [recentSessions, setRecentSessions] = useState<BackendSessionHistoryItem[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
 
+  // --- Feature: Daily Grammar Challenge ---
+  const [dailyChallenge, setDailyChallenge] = useState<{
+    title: string;
+    pattern: string;
+    example: string;
+    tip: string;
+  } | null>(null);
+
+  // --- Feature: Earned Badges ---
+  const [earnedBadges, setEarnedBadges] = useState<Array<{ id: string; name: string; icon: string; description: string }>>([]);
+
   const primaryTopic = dailyFocusTopic || 'Daily Speaking Warm-up';
 
   const getTimeGreeting = (name: string) => {
@@ -60,6 +71,26 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
       } finally {
         if (mounted) setLoadingHistory(false);
       }
+
+      // Fetch daily grammar challenge
+      try {
+        const BASE = (import.meta as any).env?.VITE_API_BASE_URL || 'http://localhost:8000';
+        const res = await fetch(`${BASE}/api/challenge/today/${profile.id || 1}`);
+        if (res.ok) {
+          const ch = await res.json();
+          if (mounted) setDailyChallenge(ch);
+        }
+      } catch (e) { /* silent */ }
+
+      // Fetch earned badges
+      try {
+        const BASE = (import.meta as any).env?.VITE_API_BASE_URL || 'http://localhost:8000';
+        const userRes = await fetch(`${BASE}/api/user/${profile.id || 1}/badges`);
+        if (userRes.ok) {
+          const badgeData = await userRes.json();
+          if (mounted) setEarnedBadges((badgeData || []).slice(0, 5));
+        }
+      } catch (e) { /* silent */ }
     }
 
     loadHistory();
@@ -96,6 +127,22 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             ? 'Ready to continue building your speaking confidence today?'
             : 'Start speaking with Toki to practice natural English with zero judgement.'}
         </p>
+
+        {/* Earned Badges Row */}
+        {earnedBadges.length > 0 && (
+          <div className="flex gap-1.5 flex-wrap mt-1">
+            {earnedBadges.map((badge) => (
+              <span
+                key={badge.id}
+                title={badge.description}
+                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-[#262a33] border border-[#3e484f]/30 text-[11px] text-[#dfe2ee]"
+              >
+                <span>{badge.icon}</span>
+                <span className="font-medium">{badge.name}</span>
+              </span>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Primary Focal Hero Card with Ambient Orb Resonance */}
@@ -179,6 +226,52 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Daily Grammar Challenge */}
+      {dailyChallenge && (
+        <div className="flex flex-col space-y-2">
+          <div className="flex items-center justify-between px-1">
+            <span className="text-[12px] text-[#bdc8d1] uppercase tracking-wider font-semibold">
+              Daily Challenge
+            </span>
+            <span className="material-symbols-outlined text-[16px] text-[#bdc2ff]">emoji_events</span>
+          </div>
+          <div className="w-full rounded-2xl bg-[#1c2028] border border-[#bdc2ff]/20 p-4 relative overflow-hidden shadow-sm">
+            <div className="absolute -top-8 -right-8 w-28 h-28 rounded-full bg-[#bdc2ff]/10 blur-2xl pointer-events-none" />
+            <div className="flex items-start gap-3 relative z-10">
+              <div className="w-9 h-9 rounded-full bg-[#bdc2ff]/15 flex-shrink-0 flex items-center justify-center mt-0.5">
+                <span className="material-symbols-outlined text-[#bdc2ff] text-[18px]" style={{ fontVariationSettings: "'FILL' 1" }}>
+                  school
+                </span>
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 mb-1.5">
+                  <span className="text-[14px] font-bold text-[#dfe2ee]">{dailyChallenge.title}</span>
+                  <span className="text-[10px] text-[#bdc2ff] bg-[#bdc2ff]/10 border border-[#bdc2ff]/20 px-2 py-0.5 rounded-full font-medium">Today</span>
+                </div>
+                <p className="text-[12px] text-[#87929a] mb-2 font-mono bg-[#0f131c]/50 rounded-lg px-2 py-1 border border-[#3e484f]/30">
+                  Pattern: {dailyChallenge.pattern}
+                </p>
+                <p className="text-[13px] text-[#bdc8d1] leading-relaxed italic">
+                  &ldquo;{dailyChallenge.example}&rdquo;
+                </p>
+                <p className="text-[11px] text-[#ffc176] mt-1.5 flex items-center gap-1">
+                  <span className="material-symbols-outlined text-[13px]">lightbulb</span>
+                  {dailyChallenge.tip}
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => onStartSession(`Daily Challenge: ${dailyChallenge.title}`)}
+              className="w-full mt-3 h-9 rounded-full bg-[#bdc2ff]/15 border border-[#bdc2ff]/30 text-[#bdc2ff] text-[12px] font-semibold flex items-center justify-center gap-1.5 hover:bg-[#bdc2ff]/25 active:scale-95 transition-all cursor-pointer"
+            >
+              <span className="material-symbols-outlined text-[14px]">play_circle</span>
+              Practice this pattern now
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Recent Practice Section */}
       <div className="flex flex-col space-y-2.5">

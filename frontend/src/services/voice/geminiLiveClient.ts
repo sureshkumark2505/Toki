@@ -27,6 +27,7 @@ export interface GeminiLiveCallbacks {
   onConnected?: (info: { model: string; voice: string }) => void;
   onClosed?: () => void;
   onCorrection?: (correction: LiveCorrection) => void;
+  onVocabSaved?: (vocab: { word: string; meaning: string }) => void;
 }
 
 export class GeminiLiveClient {
@@ -125,6 +126,11 @@ export class GeminiLiveClient {
                 corrected: msg.corrected || '',
                 explanation: msg.explanation || '',
                 explanation_native: msg.explanation_native || '',
+              });
+            } else if (msg.type === 'vocab_saved') {
+              this.callbacks.onVocabSaved?.({
+                word: msg.word || '',
+                meaning: msg.meaning || '',
               });
             } else if (msg.type === 'error') {
               this.callbacks.onError?.(msg.message || 'Gemini Live error');

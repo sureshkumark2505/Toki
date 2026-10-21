@@ -38,8 +38,8 @@ export class PCMAudioRecorder {
       }
 
       const source = this.audioContext.createMediaStreamSource(this.mediaStream);
-      // 2048 buffer size gives ~128ms chunks at 16kHz
-      this.processor = this.audioContext.createScriptProcessor(2048, 1, 1);
+      // 4096 buffer size gives ~256ms chunks at 16kHz (reduces WebSocket frame overhead)
+      this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
 
       this.processor.onaudioprocess = (e) => {
         if (!this.isRecording || this.isMuted) return;

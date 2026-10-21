@@ -420,6 +420,51 @@ def award_session_streak_and_xp(
     d.commit()
     return True, user.streak_days or 0, xp_earned, ""
 
+# ----------------- BADGES MILESTONE SYSTEM -----------------
+BADGE_DEFINITIONS = [
+    {"id": "first_session",    "name": "First Step",       "icon": "🌱", "description": "Completed your first practice session"},
+    {"id": "streak_3",         "name": "3-Day Flame",      "icon": "🔥", "description": "Maintained a 3-day streak"},
+    {"id": "streak_7",         "name": "Week Warrior",     "icon": "⚡", "description": "Maintained a 7-day streak"},
+    {"id": "streak_30",        "name": "Monthly Master",   "icon": "👑", "description": "Maintained a 30-day streak"},
+    {"id": "words_100",        "name": "Chatterbox",       "icon": "💬", "description": "Spoke 100+ words in a session"},
+    {"id": "words_500",        "name": "Fluent Flow",      "icon": "🌊", "description": "Spoke 500+ total words across sessions"},
+    {"id": "xp_100",           "name": "XP Climber",       "icon": "⭐", "description": "Earned 100 XP"},
+    {"id": "xp_500",           "name": "XP Champion",      "icon": "🏆", "description": "Earned 500 XP"},
+    {"id": "sessions_5",       "name": "Committed",        "icon": "🎯", "description": "Completed 5 sessions"},
+    {"id": "sessions_20",      "name": "Dedicated Learner","icon": "🎓", "description": "Completed 20 sessions"},
+]
+
+def check_and_award_badges(user: User, session_count: int, total_words: int, d) -> list[str]:
+    """Check milestone conditions and award new badges. Returns list of newly awarded badge ids."""
+    current_badges = list(user.badges or [])
+    existing_ids = {b["id"] if isinstance(b, dict) else b for b in current_badges}
+    newly_awarded = []
+
+    conditions = {
+        "first_session":    session_count >= 1,
+        "streak_3":         (user.streak_days or 0) >= 3,
+        "streak_7":         (user.streak_days or 0) >= 7,
+        "streak_30":        (user.streak_days or 0) >= 30,
+        "words_100":        total_words >= 100,
+        "words_500":        total_words >= 500,
+        "xp_100":           (user.xp or 0) >= 100,
+        "xp_500":           (user.xp or 0) >= 500,
+        "sessions_5":       session_count >= 5,
+        "sessions_20":      session_count >= 20,
+    }
+
+    for badge in BADGE_DEFINITIONS:
+        bid = badge["id"]
+        if bid not in existing_ids and conditions.get(bid, False):
+            current_badges.append(badge)
+            newly_awarded.append(bid)
+
+    if newly_awarded:
+        user.badges = current_badges
+        d.commit()
+
+    return newly_awarded
+
 # ----------------- GEMINI LIVE REAL-TIME AUDIO WEBSOCKET -----------------
 @app.websocket("/api/ws/live/{session_id}")
 async def websocket_live_session(websocket: WebSocket, session_id: int):
@@ -504,6 +549,9 @@ async def websocket_live_session(websocket: WebSocket, session_id: int):
         user_id = session.user_id
 
         async def run_turn_analysis(text: str):
+            # NEW: skip analysis for very short turns (< 8 non-space words)
+            if len(text.split()) < 8:
+                return
             if not is_meaningful_turn(text):
                 return
             try:
@@ -786,6 +834,23 @@ def end_session(session_id: int, d: DbSession = Depends(db)):
     corrections_list = [c.model_dump() for c in report.key_corrections]
     vocab_list = [v.model_dump() for v in report.vocabulary_captured]
 
+    # Save captured vocabulary to user's vocab bank
+    for vocab_item in report.vocabulary_captured:
+        word = vocab_item.word.strip()
+        if word:
+            existing_vocab = d.query(Vocabulary).filter_by(user_id=session.user_id, word_or_phrase=word).first()
+            if not existing_vocab:
+                d.add(Vocabulary(
+                    user_id=session.user_id,
+                    word_or_phrase=word,
+                    meaning=vocab_item.meaning,
+                    example=vocab_item.example,
+                    mastery=0,
+                    interval_days=1,
+                    review_count=0,
+                ))
+    d.commit()
+
     feedback = d.query(SessionFeedback).filter_by(session_id=session_id).first()
     if not feedback:
         feedback = SessionFeedback(
@@ -844,7 +909,7 @@ def end_session(session_id: int, d: DbSession = Depends(db)):
                     next_review=datetime.utcnow() + timedelta(days=1)
                 ))
 
-    # Auto-save captured vocabulary
+    # Auto-save captured vocabulary (legacy fallback using vocab_list dicts)
     for vocab in vocab_list:
         word = vocab.get("word")
         if word and not d.query(Vocabulary).filter_by(user_id=session.user_id, word_or_phrase=word).first():
@@ -859,6 +924,37 @@ def end_session(session_id: int, d: DbSession = Depends(db)):
             ))
     d.commit()
 
+    # Award badges
+    session_count = d.query(Session).filter_by(user_id=session.user_id).count()
+    total_session_words = sum(len(t.transcript.split()) for t in turns if t.speaker == "learner" and t.transcript)
+    newly_awarded_badges = check_and_award_badges(user, session_count, total_session_words, d)
+
+    # Auto-adjust difficulty: if recent 3 sessions avg fluency > 85, promote level
+    LEVEL_PROGRESSION = {
+        "Beginner (A1)": "Elementary (A2)",
+        "Elementary (A2)": "Pre-Intermediate (B1)",
+        "Developing": "Intermediate (B1/B2)",
+        "Pre-Intermediate (B1)": "Intermediate (B1/B2)",
+        "Intermediate (B1/B2)": "Upper-Intermediate (B2)",
+        "Upper-Intermediate (B2)": "Advanced (C1)",
+        "Advanced (C1)": "Advanced (C1)",  # cap
+    }
+
+    recent_feedbacks = d.query(SessionFeedback).filter_by(user_id=session.user_id).order_by(SessionFeedback.id.desc()).limit(3).all()
+    if len(recent_feedbacks) >= 3:
+        avg_fluency = sum(f.fluency_score or 75 for f in recent_feedbacks) / 3
+        if avg_fluency >= 85:
+            profile = d.query(LearningProfile).filter_by(user_id=session.user_id).first()
+            if profile and profile.level in LEVEL_PROGRESSION:
+                next_level = LEVEL_PROGRESSION[profile.level]
+                if next_level != profile.level:
+                    profile.level = next_level
+                    d.commit()
+                    logger.info(f"Auto-promoted user {session.user_id} to {next_level}")
+
+    # Resolve newly_awarded_badges to full badge objects for response
+    newly_awarded_badge_objs = [b for b in BADGE_DEFINITIONS if b["id"] in newly_awarded_badges]
+
     return SessionReportResponse(
         session_id=session_id,
         summary=report.summary,
@@ -871,7 +967,8 @@ def end_session(session_id: int, d: DbSession = Depends(db)):
         streak_counted=True,
         streak_days=streak_days,
         xp_earned=xp_earned,
-        practice_message=""
+        practice_message="",
+        newly_awarded_badges=newly_awarded_badge_objs
     )
 
 @app.get("/api/sessions/history/{user_id}", response_model=list[SessionHistoryItem])
@@ -932,6 +1029,52 @@ def get_session_feedback(session_id: int, d: DbSession = Depends(db)):
         vocabulary_captured=feedback.vocabulary_captured or [],
         recommended_exercise=feedback.recommended_exercise or ""
     )
+
+# ----------------- SESSION TRANSCRIPT REPLAY -----------------
+@app.get("/api/sessions/{session_id}/transcript")
+def get_session_transcript(session_id: int, d: DbSession = Depends(db)):
+    session = d.get(Session, session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    turns = d.query(Turn).filter_by(session_id=session_id).order_by(Turn.created_at).all()
+    return {
+        "session_id": session_id,
+        "objective": session.objective,
+        "started_at": session.started_at.isoformat() if session.started_at else None,
+        "ended_at": session.ended_at.isoformat() if session.ended_at else None,
+        "turns": [
+            {
+                "id": t.id,
+                "speaker": t.speaker,
+                "text": t.transcript,
+                "timestamp": t.created_at.isoformat() if t.created_at else None,
+            }
+            for t in turns if t.transcript and t.transcript.strip()
+        ]
+    }
+
+# ----------------- DAILY GRAMMAR CHALLENGE -----------------
+DAILY_GRAMMAR_CHALLENGES = [
+    {"day": 0, "title": "Past Simple Storytelling",     "pattern": "Used 'went', 'ate', 'saw' etc.", "example": "Yesterday, I went to the market and bought fresh vegetables.", "tip": "Use simple past (-ed or irregular) for completed actions."},
+    {"day": 1, "title": "Relative Clauses",             "pattern": "who / which / that + clause",   "example": "The colleague who helped me is very knowledgeable.", "tip": "Use 'who' for people, 'which' for things, 'that' for both."},
+    {"day": 2, "title": "Polite Requests",              "pattern": "Could you / Would you mind...", "example": "Could you please explain this again more slowly?", "tip": "Add 'please' and a soft tone — it makes requests natural."},
+    {"day": 3, "title": "Present Perfect",              "pattern": "have/has + past participle",    "example": "I have been practicing English for three months.", "tip": "Use present perfect for experience or recent past with present relevance."},
+    {"day": 4, "title": "Connecting Ideas",             "pattern": "however / therefore / moreover","example": "I was nervous; however, I spoke confidently.", "tip": "Connectors make your speech sound structured and fluent."},
+    {"day": 5, "title": "Conditional Sentences",        "pattern": "If I ... , I would ...",        "example": "If I had more time, I would practice speaking every morning.", "tip": "Use 2nd conditional for hypothetical situations."},
+    {"day": 6, "title": "Describing Feelings & Opinions","pattern": "I feel / I think / In my view","example": "In my view, consistent practice is the best way to improve.", "tip": "Express opinions clearly — avoid vague 'it is good'."},
+]
+
+@app.get("/api/challenge/today/{user_id}")
+def get_daily_challenge(user_id: int, d: DbSession = Depends(db)):
+    day_index = date.today().toordinal() % len(DAILY_GRAMMAR_CHALLENGES)
+    challenge = DAILY_GRAMMAR_CHALLENGES[day_index]
+    # Count sessions for this user to personalize message
+    session_count = d.query(Session).filter_by(user_id=user_id).count()
+    return {
+        **challenge,
+        "date": date.today().isoformat(),
+        "session_count": session_count,
+    }
 
 # ----------------- MISTAKE MEMORY & SPACED REPETITION (PHASE 4) -----------------
 SPACED_INTERVALS = [1, 2, 4, 7, 14, 30]

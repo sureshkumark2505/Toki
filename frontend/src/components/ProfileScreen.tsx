@@ -22,6 +22,7 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = ({
   const [accent, setAccent] = useState('Calm British (Neutral UK)');
   const [feedbackLevel, setFeedbackLevel] = useState<'gentle' | 'balanced' | 'rigorous'>('gentle');
   const [dashboard, setDashboard] = useState<BackendProgressDashboard | null>(null);
+  const [badges, setBadges] = useState<Array<{ id: string; name: string; icon: string; description: string }>>([]);
   const [isEditingName, setIsEditingName] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
@@ -31,10 +32,15 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = ({
     let mounted = true;
     async function loadData() {
       try {
-        const [prog, settings] = await Promise.allSettled([
+        const [prog, settings, userBadges] = await Promise.allSettled([
           tokiApi.getProgress(userId),
           tokiApi.getUserSettings(userId),
+          tokiApi.getUserBadges(userId),
         ]);
+
+        if (mounted && userBadges.status === 'fulfilled' && userBadges.value) {
+          setBadges(userBadges.value);
+        }
 
         if (mounted && prog.status === 'fulfilled' && prog.value) {
           setDashboard(prog.value);
@@ -252,7 +258,38 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = ({
       <div className="flex flex-col space-y-2">
         <div className="flex items-center justify-between px-1">
           <span className="text-[12px] text-[#bdc8d1] uppercase tracking-wider font-semibold">
-            Speaking Milestones
+            Earned Badges &amp; Milestones
+          </span>
+          <span className="text-[12px] text-[#8ed5ff]">{badges.length} Unlocked</span>
+        </div>
+
+        {badges.length > 0 ? (
+          <div className="grid grid-cols-2 gap-2">
+            {badges.map((b) => (
+              <div
+                key={b.id}
+                className="bg-[#1c2028] border border-[#3e484f]/25 rounded-xl p-3 flex items-center gap-2.5 shadow-sm"
+              >
+                <span className="text-[24px] shrink-0">{b.icon}</span>
+                <div className="flex flex-col min-w-0">
+                  <span className="text-[13px] font-semibold text-[#dfe2ee] truncate">{b.name}</span>
+                  <span className="text-[11px] text-[#87929a] line-clamp-1">{b.description}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="bg-[#1c2028] border border-[#3e484f]/25 rounded-xl p-3 text-center text-[#87929a] text-[12px]">
+            Complete practice sessions to earn achievement badges.
+          </div>
+        )}
+      </div>
+
+      {/* Speaking Confidence Metrics */}
+      <div className="flex flex-col space-y-2">
+        <div className="flex items-center justify-between px-1">
+          <span className="text-[12px] text-[#bdc8d1] uppercase tracking-wider font-semibold">
+            Speaking Metrics
           </span>
           <span className="text-[12px] text-[#8ed5ff]">Live Metrics</span>
         </div>

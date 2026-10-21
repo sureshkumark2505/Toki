@@ -247,6 +247,9 @@ def build_live_system_prompt(
         f"Active correction style: {style_name}.\n"
         f"RECURRING MISTAKES (top 3 from DB): steer the chat so they get a natural chance to use these "
         f"correctly; praise when they do:\n{mistakes_str}\n"
+        f"TOPIC STEERING: After 3 learner turns on the same sub-topic, introduce a new angle or challenge "
+        f"using one of their recurring mistakes. For example, 'Now let\\'s talk about... — but try using "
+        f"[grammar pattern].'. Keep energy varied.\n"
         f"WRAP-UP: on goodbye, give one sentence of specific encouragement plus the single most useful thing "
         f"to remember, then say goodbye."
     )

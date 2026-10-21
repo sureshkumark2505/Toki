@@ -33,6 +33,16 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
   const [isPlayingCorrection, setIsPlayingCorrection] = useState(false);
   const [, startTransition] = useTransition();
 
+  // --- Feature: Session Timer Warning ---
+  const [showStreakWarning, setShowStreakWarning] = useState(false);
+
+  // --- Feature: Barge-In Visual Feedback ---
+  const [showBargeInFlash, setShowBargeInFlash] = useState(false);
+  const [bargeInLabel, setBargeInLabel] = useState(false);
+
+  // --- Feature: Vocabulary Saved Toast ---
+  const [vocabToast, setVocabToast] = useState<{ word: string; meaning: string } | null>(null);
+
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
   const liveClientRef = useRef<GeminiLiveClient | null>(null);
   const wordsExchangedRef = useRef<number>(0);
@@ -42,10 +52,17 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
   // Session timer
   useEffect(() => {
     const timer = setInterval(() => {
-      setSeconds((prev) => prev + 1);
+      setSeconds((prev) => {
+        // Show streak warning at 90 seconds if very few transcripts
+        if (prev + 1 === 90 && transcripts.filter(t => t.speaker === 'user').length < 3) {
+          setShowStreakWarning(true);
+          setTimeout(() => setShowStreakWarning(false), 5000);
+        }
+        return prev + 1;
+      });
     }, 1000);
     return () => clearInterval(timer);
-  }, []);
+  }, [transcripts]);
 
   // Format mm:ss
   const formatTime = (totalSecs: number) => {
@@ -56,6 +73,7 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
 
   // State label mapping
   const getStateMessage = () => {
+    if (bargeInLabel) return { text: 'Barge-in! You interrupted Toki 👏', color: 'text-[#8ed5ff]' };
     if (isMicMuted) return { text: 'Session paused • Tap mic to resume', color: 'text-[#87929a]' };
     switch (voiceState) {
       case 'listening':
@@ -96,15 +114,31 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
         const fullSpeech = currentTokiSpeechRef.current.trim();
         if (fullSpeech) {
           wordsExchangedRef.current += fullSpeech.split(/\s+/).length;
-          setTranscripts((prev) => [
-            ...prev,
-            {
-              id: `toki-${Date.now()}`,
-              speaker: 'toki',
-              text: fullSpeech,
-              timestamp: formatTime(seconds),
-            },
-          ]);
+          setTranscripts((prev) => {
+            const updated = [
+              ...prev,
+              {
+                id: `toki-${Date.now()}`,
+                speaker: 'toki' as const,
+                text: fullSpeech,
+                timestamp: formatTime(seconds),
+              },
+            ];
+            // Show vocab toast occasionally (every 4th toki turn after 60s)
+            if (seconds > 60 && updated.length > 0 && updated.length % 4 === 0) {
+              const VOCAB_HINTS = [
+                { word: 'Elaborate', meaning: 'to explain in more detail' },
+                { word: 'Articulate', meaning: 'to express clearly and effectively' },
+                { word: 'Consistently', meaning: 'in the same way, regularly' },
+                { word: 'Nevertheless', meaning: 'despite that, however' },
+                { word: 'Furthermore', meaning: 'in addition, also' },
+              ];
+              const hint = VOCAB_HINTS[Math.floor(Math.random() * VOCAB_HINTS.length)];
+              setVocabToast(hint);
+              setTimeout(() => setVocabToast(null), 4000);
+            }
+            return updated;
+          });
           currentTokiSpeechRef.current = '';
           setCurrentTokiSpeech('');
         }
@@ -144,9 +178,21 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
         }
         currentTokiSpeechRef.current = '';
         setCurrentTokiSpeech('');
+        // Barge-in flash overlay
+        setShowBargeInFlash(true);
+        setTimeout(() => setShowBargeInFlash(false), 800);
+        // Barge-in status label
+        setBargeInLabel(true);
+        setTimeout(() => setBargeInLabel(false), 1500);
       },
       onCorrection: (corr) => {
         setLiveCorrections((prev) => [...prev.slice(-3), corr]);
+      },
+      onVocabSaved: (vocab) => {
+        if (vocab.word) {
+          setVocabToast(vocab);
+          setTimeout(() => setVocabToast(null), 4000);
+        }
       },
       onError: (err) => {
         console.warn('Gemini Live error:', err);
@@ -377,6 +423,10 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
 
         {/* TOP 55–60%: Toki Orb & Voice Living Presence */}
         <section className="flex-[3] flex flex-col items-center justify-center relative overflow-hidden py-2">
+          {/* Barge-in flash overlay */}
+          {showBargeInFlash && (
+            <div className="absolute inset-0 rounded-2xl bg-[#38bdf8]/10 animate-ping pointer-events-none z-20" style={{ animationDuration: '0.4s', animationIterationCount: 2 }} />
+          )}
           {/* Subtle Ambient Radial Glow */}
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
             <div className="w-64 h-64 rounded-full bg-[#38bdf8]/10 blur-3xl animate-pulse" />
@@ -412,6 +462,37 @@ export const ActiveSessionScreen: React.FC<ActiveSessionScreenProps> = ({
             </div>
           </div>
         </section>
+
+        {/* Streak Warning Banner */}
+        {showStreakWarning && (
+          <div className="mb-2 bg-[#ffc176]/10 border border-[#ffc176]/30 rounded-2xl px-4 py-2.5 flex items-center gap-2.5 animate-in fade-in slide-in-from-top-2 duration-300">
+            <span className="material-symbols-outlined text-[#ffc176] text-[18px]" style={{ fontVariationSettings: "'FILL' 1" }}>
+              local_fire_department
+            </span>
+            <p className="text-[12px] text-[#ffc176] font-medium">
+              Speak a few more sentences to earn your daily streak &amp; XP!
+            </p>
+            <button type="button" onClick={() => setShowStreakWarning(false)} className="ml-auto text-[#ffc176]/60 hover:text-[#ffc176] cursor-pointer">
+              <span className="material-symbols-outlined text-[16px]">close</span>
+            </button>
+          </div>
+        )}
+
+        {/* Vocabulary Toast */}
+        {vocabToast && (
+          <div className="mb-2 bg-[#bdc2ff]/10 border border-[#bdc2ff]/30 rounded-2xl px-4 py-2.5 flex items-center gap-2.5 animate-in fade-in slide-in-from-bottom-2 duration-300">
+            <span className="material-symbols-outlined text-[#bdc2ff] text-[18px]" style={{ fontVariationSettings: "'FILL' 1" }}>
+              bookmark_added
+            </span>
+            <div className="flex flex-col">
+              <span className="text-[12px] text-[#bdc2ff] font-semibold">Word saved: "{vocabToast.word}"</span>
+              <span className="text-[11px] text-[#87929a]">{vocabToast.meaning}</span>
+            </div>
+            <button type="button" onClick={() => setVocabToast(null)} className="ml-auto text-[#bdc2ff]/60 hover:text-[#bdc2ff] cursor-pointer">
+              <span className="material-symbols-outlined text-[16px]">close</span>
+            </button>
+          </div>
+        )}
 
         {/* Real-time Live Correction Card */}
         {liveCorrections.length > 0 && (() => {

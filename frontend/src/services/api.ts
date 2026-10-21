@@ -340,5 +340,27 @@ export const tokiApi = {
     }
   },
 
+  // Transcript Replay, Challenges, Badges
+  async getSessionTranscript(sessionId: number): Promise<any> {
+    return request<any>(`/api/sessions/${sessionId}/transcript`);
+  },
+
+  async getDailyChallenge(userId: number): Promise<any> {
+    try {
+      return await request<any>(`/api/challenge/today/${userId}`);
+    } catch {
+      return null;
+    }
+  },
+
+  async getUserBadges(userId: number): Promise<any[]> {
+    try {
+      const user = await request<any>(`/api/user/${userId}`);
+      return user?.badges || [];
+    } catch {
+      return [];
+    }
+  },
+
   formatReportToFeedbackData,
 };
